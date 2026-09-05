@@ -1,0 +1,53 @@
+heptabase:
+  reading_history_path: data/reading_history.json # 由 `get_hepthabase_bot.py --export` 產生的閱讀紀錄。相對路徑以專案根目錄為基準。
+  include_path: null # 只保留符合這些 glob 的分類路徑。需要卡片表格有分類欄才有作用。範例: ["LLM/**"]
+  ignore_path: null # 排除符合這些 glob 的分類路徑。範例: ["archive/**"]
+
+source:
+  arxiv:
+    category: null # 目標 arxiv 分類，代號查詢 https://arxiv.org/category_taxonomy 。範例: ["cs.AI","cs.CV","cs.LG","cs.CL"]
+    include_cross_list: false # 是否納入 cross-list 論文。
+    lookback_days: null # 檢索最近幾天的論文。null 或 1：讀 RSS 當日公告（上游行為）。設 7：改用 arXiv API 抓最近 7 天投稿，適合每週執行一次。
+    max_results: 2000 # 日期區間模式的單次上限，避免類別選太廣時無限抓取。
+  biorxiv:
+    category: null # 目標 biorxiv 分類。範例: ["biochemistry"]
+  medrxiv:
+    category: null # 目標 medrxiv 分類。範例: ["neurology"]
+  chemrxiv:
+    include_new_versions: false # 是否納入舊 preprint 的修訂版（v2, v3, ...）。
+
+email:
+  sender: ${oc.env:SENDER_EMAIL,""} # 寄件的 SMTP 帳號。
+  receiver: ${oc.env:SMTP_RECEIVER,""} # 收論文清單的信箱。
+  smtp_server: ${oc.env:SMTP_SERVER,""} # SMTP 伺服器位址。
+  smtp_port: 465 # SMTP 連接埠。寫死成整數：oc.env 會把預設值變成字串，而 smtplib 需要整數。
+  sender_password: ${oc.env:SENDER_APP_PASSWORD,""} # 應用程式密碼，通常不等於信箱登入密碼。
+
+llm:
+  api:
+    key: ${oc.env:OPENAI_API_KEY,dummy} # 尚未申請金鑰時保持 dummy：TLDR 會自動回退成 abstract，流程仍可跑完。
+    base_url: ${oc.env:OPENAI_BASE_URL,https://api.openai.com/v1}
+  api_mode: chat_completion # chat_completion 或 response。
+  generation_kwargs:
+    max_tokens: 16384
+    model: ${oc.env:OPENAI_MODEL,gpt-4o-mini}
+  language: Traditional Chinese # TLDR 使用的語言。
+
+reranker:
+  local:
+    model: jinaai/jina-embeddings-v5-text-nano-retrieval # 本機 embedding 模型的 Hugging Face 名稱。
+    encode_kwargs:
+      task: retrieval
+      prompt_name: document
+  api:
+    key: ${oc.env:EMBEDDING_API_KEY,null} # 改用 API embedding 時填入。
+    base_url: ${oc.env:EMBEDDING_BASE_URL,null}
+    model: ${oc.env:EMBEDDING_MODEL,null}
+    batch_size: null # 依供應商上限調整。範例: 64
+
+executor:
+  debug: false
+  send_empty: false # 當天沒有新論文時是否仍寄空信。
+  max_paper_num: 100 # 郵件中呈現的論文數量上限。
+  source: ['arxiv'] # 要檢索的來源。範例: ['arxiv','biorxiv','medrxiv','chemrxiv']
+  reranker: local # local 用本機模型（免 API）；api 用 embedding API（免安裝 torch）。

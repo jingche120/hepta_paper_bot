@@ -1,0 +1,9 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+# src/zotero_arxiv_daily 是 TideDra/zotero-arxiv-daily 的原樣複製。
+# 排除在外，是為了讓 diff 只顯示我們的實質修改，日後能繼續與上游比對合併。
+exclude = ["src/zotero_arxiv_daily"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

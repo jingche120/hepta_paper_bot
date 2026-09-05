@@ -1,0 +1,5 @@
+# 本機 embedding 排序（config 的 executor.reranker: local）才需要，體積數百 MB。
+# 改用 embedding API（executor.reranker: api）時不需安裝。
+-r requirements.txt
+sentence-transformers>=5.0.0
+torch>=2.4.0
