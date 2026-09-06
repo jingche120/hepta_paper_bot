@@ -87,7 +87,8 @@ class ExecutorPoolTestCase(unittest.TestCase):
         self.executor.openai_client = None
         self.executor.include_path_patterns = None
         self.executor.ignore_path_patterns = None
-        self.history = [corpus_paper("Newest", "aaa", 0), corpus_paper("Oldest", "bbb", 100)]
+        # 閱讀紀錄從檔案讀出來是「舊到新」，排序才有事可做。
+        self.history = [corpus_paper("Oldest", "bbb", 100), corpus_paper("Newest", "aaa", 0)]
 
     def seed(self, specs):
         with open_pool(self.db) as pool:
@@ -204,7 +205,8 @@ class HistoryOrderTests(ExecutorPoolTestCase):
         ):
             self.executor.run()
         history_batch = seen[-1]
-        self.assertEqual(history_batch, ["aaa", "bbb"])  # Newest 在前
+        # 傳進來是 [Oldest, Newest]，送去 embed 前必須翻成 [Newest, Oldest]。
+        self.assertEqual(history_batch, ["aaa", "bbb"])
 
 
 class IngestTests(ExecutorPoolTestCase):
