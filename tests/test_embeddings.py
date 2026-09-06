@@ -1,0 +1,118 @@
+"""驗證向量計算。以假的 client 取代 API，全部離線。"""
+
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from embeddings import MAX_CHARS, embed_pending, embed_texts  # noqa: E402
+from paper_pool import PaperRecord, open_pool  # noqa: E402
+
+DIM = 4
+
+
+class FakeClient:
+    def __init__(self, shuffle=False):
+        self.calls = []
+        self.shuffle = shuffle
+        self.embeddings = SimpleNamespace(create=self._create)
+
+    def _create(self, input, model):
+        self.calls.append({"input": list(input), "model": model})
+        data = [
+            SimpleNamespace(index=i, embedding=[float(len(t)), 1.0, 0.0, 0.0])
+            for i, t in enumerate(input)
+        ]
+        if self.shuffle:
+            data.reverse()
+        return SimpleNamespace(data=data)
+
+
+class EmbedTextsTests(unittest.TestCase):
+    def test_batches_respect_the_batch_size(self):
+        client = FakeClient()
+        embed_texts(client, "m", ["a", "b", "c", "d", "e"], batch_size=2)
+        self.assertEqual([len(c["input"]) for c in client.calls], [2, 2, 1])
+
+    def test_output_order_matches_input_even_if_api_reorders(self):
+        # API 不保證回傳順序；錯位會把向量配到錯的論文上。
+        client = FakeClient(shuffle=True)
+        vectors = embed_texts(client, "m", ["a", "bb", "ccc"], batch_size=3)
+        self.assertEqual([v[0] for v in vectors], [1.0, 2.0, 3.0])
+
+    def test_overlong_text_is_truncated(self):
+        client = FakeClient()
+        embed_texts(client, "m", ["x" * (MAX_CHARS + 500)])
+        self.assertEqual(len(client.calls[0]["input"][0]), MAX_CHARS)
+
+    def test_model_is_passed_through(self):
+        client = FakeClient()
+        embed_texts(client, "text-embedding-3-small", ["a"])
+        self.assertEqual(client.calls[0]["model"], "text-embedding-3-small")
+
+    def test_empty_input_makes_no_calls(self):
+        client = FakeClient()
+        self.assertEqual(embed_texts(client, "m", []), [])
+        self.assertEqual(client.calls, [])
+
+    def test_zero_batch_size_is_rejected(self):
+        with self.assertRaises(ValueError):
+            embed_texts(FakeClient(), "m", ["a"], batch_size=0)
+
+
+class EmbedPendingTests(unittest.TestCase):
+    def setUp(self):
+        self.pool = open_pool(":memory:")
+        self.addCleanup(self.pool.close)
+        self.pool.ingest(
+            [
+                PaperRecord(id=f"p{i}", source="arxiv", title=f"T{i}", abstract=f"abstract {i}")
+                for i in range(5)
+            ]
+        )
+
+    def test_all_pending_papers_get_vectors(self):
+        client = FakeClient()
+        self.assertEqual(embed_pending(self.pool, client, "m", 2, show_progress=False), 5)
+        self.assertEqual(self.pool.stats()["pending_embedding"], 0)
+
+    def test_second_run_computes_nothing(self):
+        client = FakeClient()
+        embed_pending(self.pool, client, "m", 2, show_progress=False)
+        before = len(client.calls)
+        self.assertEqual(embed_pending(self.pool, client, "m", 2, show_progress=False), 0)
+        # 沒有新的 API 呼叫：這是每天的成本控制關鍵。
+        self.assertEqual(len(client.calls), before)
+
+    def test_changing_model_recomputes_everything(self):
+        client = FakeClient()
+        embed_pending(self.pool, client, "m1", 5, show_progress=False)
+        self.assertEqual(embed_pending(self.pool, client, "m2", 5, show_progress=False), 5)
+
+    def test_vectors_land_on_the_right_papers(self):
+        # abstract "abstract 0" 長度 10、"abstract 4" 也是 10，改用不同長度來分辨。
+        pool = open_pool(":memory:")
+        self.addCleanup(pool.close)
+        pool.ingest(
+            [
+                PaperRecord(id="short", source="arxiv", title="A", abstract="ab"),
+                PaperRecord(id="long", source="arxiv", title="B", abstract="abcdef"),
+            ]
+        )
+        embed_pending(pool, FakeClient(shuffle=True), "m", 2, show_progress=False)
+        picked = {p.id: p for p in pool.select([1.0, 0.0, 0.0, 0.0], 0, 2, 7)}
+        # 向量第一維等於摘要長度，正規化後長度較長者的分數較高。
+        self.assertGreater(picked["long"].score, picked["short"].score)
+
+    def test_empty_pool_is_a_noop(self):
+        pool = open_pool(":memory:")
+        self.addCleanup(pool.close)
+        client = FakeClient()
+        self.assertEqual(embed_pending(pool, client, "m", show_progress=False), 0)
+        self.assertEqual(client.calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -113,15 +113,25 @@ def build_date_range_query(categories: list[str], lookback_days: int, now: datet
     submittedDate is the original submission time, so this selects genuinely new papers --
     the API equivalent of the RSS feed's announce_type "new".
     """
-    if not categories:
-        raise ValueError("category must be specified for arxiv.")
     if lookback_days < 1:
         raise ValueError("source.arxiv.lookback_days must be at least 1.")
     end = now or datetime.now(timezone.utc)
-    start = end - timedelta(days=lookback_days)
+    return build_window_query(categories, end - timedelta(days=lookback_days), end)
+
+
+def build_window_query(categories: list[str], start, end) -> str:
+    """Build an arXiv API query for *categories* submitted between *start* and *end*.
+
+    Backfilling several years has to be chunked, because a single arXiv query caps the
+    number of results it will page through. Taking an explicit window rather than a
+    lookback lets the caller walk quarter by quarter.
+    """
+    if not categories:
+        raise ValueError("category must be specified for arxiv.")
+    if start > end:
+        raise ValueError("start must not be after end.")
     cat_query = " OR ".join(f"cat:{c}" for c in categories)
-    window = f"[{start:%Y%m%d%H%M} TO {end:%Y%m%d%H%M}]"
-    return f"({cat_query}) AND submittedDate:{window}"
+    return f"({cat_query}) AND submittedDate:[{start:%Y%m%d%H%M} TO {end:%Y%m%d%H%M}]"
 
 
 @register_retriever("arxiv")
@@ -146,12 +156,22 @@ class ArxivRetriever(BaseRetriever):
         submittedDate range instead. RSS marks cross-lists with announce_type; the API has
         no such field, so cross-lists are excluded by checking primary_category instead.
         """
-        client = arxiv.Client(num_retries=10, delay_seconds=10, page_size=100)
         categories = list(self.config.source.arxiv.category)
-        include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        max_results = self.config.source.arxiv.get("max_results", 2000)
         query = build_date_range_query(categories, lookback_days)
         logger.info(f"Querying arxiv API for the last {lookback_days} days: {query}")
+        return self._run_query(query, categories)
+
+    def _retrieve_by_date_range_between(self, start, end) -> list[ArxivResult]:
+        """Retrieve papers submitted between two explicit datetimes. Used by backfill."""
+        categories = list(self.config.source.arxiv.category)
+        query = build_window_query(categories, start, end)
+        logger.info(f"Querying arxiv API for {start} to {end}")
+        return self._run_query(query, categories)
+
+    def _run_query(self, query: str, categories: list[str]) -> list[ArxivResult]:
+        client = arxiv.Client(num_retries=10, delay_seconds=10, page_size=100)
+        include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
+        max_results = self.config.source.arxiv.get("max_results", 2000)
 
         search = arxiv.Search(
             query=query,
