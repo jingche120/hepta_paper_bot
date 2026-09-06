@@ -398,6 +398,20 @@ class PaperPool:
             params.append(limit)
         return [(row["id"], row["abstract"]) for row in self._conn.execute(sql, params)]
 
+    def embedding_models(self):
+        """池中現有向量的模型分佈。
+
+        換模型會讓整池重算並重新計費（17,922 篇約 $0.13~$0.86），
+        所以呼叫端要能在動手前先看到這件事。
+        """
+        return {
+            row["embedding_model"]: row["n"]
+            for row in self._conn.execute(
+                "SELECT embedding_model, COUNT(*) AS n FROM papers"
+                " WHERE embedding IS NOT NULL GROUP BY embedding_model"
+            )
+        }
+
     def select(self, centroid, n_new, n_old, new_within_days, today=None, model=None):
         """依配額與輪替排序選出要推薦的論文。
 

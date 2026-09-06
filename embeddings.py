@@ -205,6 +205,13 @@ def embed_pending(pool, embedder, batch_size=None, show_progress=True):
     pending = pool.pending_embeddings(model)
     if not pending:
         return 0
+    outdated = {m: n for m, n in pool.embedding_models().items() if m != model}
+    if outdated:
+        # 一個拼錯的模型名稱就會讓整池重算並重新計費，這不該悄悄發生。
+        listed = "、".join(f"{m}（{n} 篇）" for m, n in sorted(outdated.items()))
+        logger.warning(
+            f"池中已有其他模型算好的向量：{listed}。改用 {model} 會把它們全部重算並重新計費。"
+        )
     logger.info(f"Computing embeddings for {len(pending)} papers with {model}")
 
     batches = range(0, len(pending), batch_size)

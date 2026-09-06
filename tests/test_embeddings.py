@@ -344,5 +344,45 @@ class RetryTests(unittest.TestCase):
         self.assertEqual(client.calls, 1)
 
 
+class ModelChangeTests(unittest.TestCase):
+    """換模型會讓整池重算並重新計費，不該悄悄發生。"""
+
+    def seed(self, pool, model):
+        pool.ingest(
+            PaperRecord(id=f"p{i}", source="s", title=f"T{i}", abstract="a") for i in range(3)
+        )
+        pool.store_embeddings(((f"p{i}", [1.0, 0.0, 0.0, 0.0]) for i in range(3)), model)
+
+    def test_switching_models_recomputes_everything(self):
+        with open_pool(":memory:") as pool:
+            self.seed(pool, "text-embedding-3-large")
+            self.assertEqual(pool.embedding_models(), {"text-embedding-3-large": 3})
+            done = embed_pending(
+                pool, ApiEmbedder(FakeClient(), "text-embedding-3-small"), show_progress=False
+            )
+            self.assertEqual(done, 3)
+            self.assertEqual(pool.embedding_models(), {"text-embedding-3-small": 3})
+
+    def test_the_recompute_is_announced(self):
+        messages = []
+        with open_pool(":memory:") as pool:
+            self.seed(pool, "text-embedding-3-large")
+            with patch("embeddings.logger.warning", side_effect=messages.append):
+                embed_pending(
+                    pool, ApiEmbedder(FakeClient(), "text-embedding-3-small"), show_progress=False
+                )
+        self.assertTrue(messages, "換模型必須出聲警告")
+        self.assertIn("text-embedding-3-large", messages[0])
+
+    def test_the_same_model_says_nothing(self):
+        messages = []
+        with open_pool(":memory:") as pool:
+            self.seed(pool, "m")
+            pool.ingest([PaperRecord(id="new", source="s", title="New", abstract="a")])
+            with patch("embeddings.logger.warning", side_effect=messages.append):
+                embed_pending(pool, ApiEmbedder(FakeClient(), "m"), show_progress=False)
+        self.assertEqual(messages, [])
+
+
 if __name__ == "__main__":
     unittest.main()
