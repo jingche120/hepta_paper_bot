@@ -167,9 +167,13 @@ class Executor:
 
             unmatched = pool.mark_carded(history)
             if unmatched:
-                logger.warning(
-                    "These cards matched no paper in the pool, so those papers may be "
-                    f"recommended again. Fix the 來源論文 line on each: {unmatched}"
+                # 多數情況下這是正常的：讀過的論文來自沒有追蹤的期刊，本來就不在池中，
+                # 也就不會被推薦。只有當那篇論文確實在池中、卻因為卡片標題不是論文名
+                # （`來源論文：` 指向查詢網址時）而比對不到，才需要動手修卡片。
+                logger.info(
+                    f"{len(unmatched)} cards matched no paper in the pool. That is expected for "
+                    "papers outside the backfilled sources; if one should be in the pool, check "
+                    f"its 來源論文 line: {unmatched}"
                 )
 
             # embedding 走 reranker.api.*（EMBEDDING_*），與 LLM 的憑證是分開的。
