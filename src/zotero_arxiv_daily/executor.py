@@ -2,13 +2,13 @@ from loguru import logger
 from omegaconf import DictConfig, ListConfig
 from embeddings import embed_pending, get_embedder
 from heptabase_reading_history import load_reading_history
-from openalex import OpenAlexClient
+from openalex import OpenAlexClient, publication_window_start
 from paper_pool import PaperRecord, open_pool, weighted_centroid
 from .utils import glob_match
 from .retriever import get_retriever_cls
 from .protocol import CorpusPaper, Paper
 import random
-from datetime import date, timedelta
+from datetime import date
 from time import sleep
 from .construct_email import render_email
 from .utils import send_email
@@ -107,11 +107,12 @@ class Executor:
         journals = self.config.pool.get("openalex_sources") or []
         if journals:
             client = OpenAlexClient(mailto=self.config.pool.get("openalex_mailto") or "")
-            # IEEE 的 publication_date 是期號日期（整年都標同一天），用它做增量
-            # 會抓不到任何新論文，因此增量一律走 created_date。
-            since = (date.today() - timedelta(days=self.config.pool.journal_lookback_days)).isoformat()
+            # 沒有真正的「增量」可用：IEEE 的 publication_date 是期號日期（整年標同一天），
+            # 而 OpenAlex 的 created/updated 日期過濾要付費方案。因此每天重抓整個
+            # 當年度，靠池子的 id 與標題去重擋掉已經有的，只有真正新增的會寫入。
+            since = publication_window_start(date.today(), self.config.pool.journal_lookback_days)
             for source_id in journals:
-                works = list(client.fetch_works(source_id, since, date_field="created"))
+                works = list(client.fetch_works(source_id, since))
                 result = pool.ingest(works)
                 logger.info(f"{source_id}: {len(works)} fetched, {result.inserted} new to the pool")
 

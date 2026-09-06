@@ -50,7 +50,10 @@ pool:
   n_new: 2 # 每天推薦幾篇「新」論文。
   n_old: 1 # 每天推薦幾篇池中的舊論文。這是回填的價值所在。
   new_within_days: 7 # 發表日在幾天內算「新」。注意 IEEE 期刊的日期是期號日期，實務上都會落在「舊」。
-  journal_lookback_days: 14 # 每日抓期刊新增時往回看幾天（用 created_date，不是 publication_date）。
+  journal_lookback_days: 30 # 期刊每天重抓「這個天數所在年份」整年，靠池子去重。
+  # 不是真的增量：IEEE 的 publication_date 是期號日期（整年標同一天），
+  # 而 OpenAlex 的 created/updated 日期過濾需要付費方案。設 30 天的效果是
+  # 平時只抓當年度，跨年那一個月同時涵蓋前一年，不會有空窗。
   openalex_sources: # 要追蹤的期刊。留空即停用期刊來源。
     - S111326731 # IEEE Transactions on Geoscience and Remote Sensing
     - S126920919 # IEEE Geoscience and Remote Sensing Letters

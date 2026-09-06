@@ -8,11 +8,20 @@ OpenAlex 免費、不需金鑰，且這兩本期刊的摘要覆蓋率實測為 1
 
 **注意 IEEE 的日期語意**：這兩本期刊的 `publication_date` 是「期號日期」而非實際
 上線日。實測 2026 年的 GRSL 與 TGRS 各抽樣 200 篇，`publication_date` 全部是
-`2026-01-01`。因此每日增量必須用 `created_date`（進入 OpenAlex 的日期），
-用 `publication_date` 會抓不到任何新論文。回填則兩者皆可，用 publication 較直觀。
+`2026-01-01`——粒度其實是「年」。
+
+因此 `from_publication_date:yesterday` 這種每日增量會回傳 0 筆而且不報錯。
+而 OpenAlex 唯一能表達「最近新增」的 `from_created_date` 與 `from_updated_date`
+**需要付費方案**（免費金鑰收到 HTTP 429 與 `"Plan upgrade required"`，
+狀態碼看起來像速率限制，實際不是）。
+
+免費方案下唯一可行的增量作法，是**重抓整個當年度**再靠候選池去重，
+起始日由 `publication_window_start()` 決定。代價是每天多幾十次請求，換到的是
+不必付費。
 """
 
 from collections.abc import Iterator
+from datetime import date, timedelta
 from time import sleep
 
 import requests
@@ -79,6 +88,20 @@ def work_to_record(work):
     )
 
 
+def publication_window_start(today, lookback_days):
+    """每日增量要從哪一天開始抓期刊。
+
+    回傳 `today - lookback_days` 所在**年份的 1 月 1 日**。
+
+    期號日期的粒度是「年」（2026 年的論文全部標成 2026-01-01），所以用天數往回推
+    會直接把整年排除——`from_publication_date:2026-08-07` 對 2026 年的論文回傳 0 筆。
+    對齊到年初才抓得到，而跨年那幾天會自然同時涵蓋前一年，不會有空窗。
+    """
+    if lookback_days < 0:
+        raise ValueError("lookback_days 不得為負數。")
+    return date((today - timedelta(days=lookback_days)).year, 1, 1).isoformat()
+
+
 class OpenAlexClient:
     """OpenAlex 唯讀客戶端，使用 cursor 分頁。"""
 
@@ -109,25 +132,20 @@ class OpenAlexClient:
                 sleep(self.retry_delay)
         raise OpenAlexError("OpenAlex 請求失敗。")
 
-    def fetch_works(
-        self, source_id, from_date, until_date=None, date_field="publication"
-    ) -> Iterator[PaperRecord]:
-        """走訪某本期刊在指定日期區間內的論文。
+    def fetch_works(self, source_id, from_date, until_date=None) -> Iterator[PaperRecord]:
+        """走訪某本期刊在指定發表日區間內的論文。
 
-        `date_field` 為 `"publication"`（期號日期）或 `"created"`（進入 OpenAlex 的日期）。
-        每日增量務必用 `"created"`：IEEE 的 publication_date 是期號日期，
-        整年的論文都標成同一天，用它做增量會抓不到東西。
+        只支援 `publication_date`。`created_date` 與 `updated_date` 要付費方案
+        （見模組開頭），所以這裡不提供那個選項——留著會讓人以為免費就能用。
 
         缺標題或摘要的紀錄會被略過，因此產出的數量會少於 OpenAlex 回報的總數。
         """
-        if date_field not in ("publication", "created"):
-            raise ValueError("date_field 必須是 'publication' 或 'created'。")
         filters = [
             f"primary_location.source.id:{source_id}",
-            f"from_{date_field}_date:{from_date}",
+            f"from_publication_date:{from_date}",
         ]
         if until_date:
-            filters.append(f"to_{date_field}_date:{until_date}")
+            filters.append(f"to_publication_date:{until_date}")
 
         cursor = "*"
         seen_cursors = {cursor}

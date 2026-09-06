@@ -2,6 +2,7 @@
 
 import sys
 import unittest
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -10,6 +11,7 @@ from openalex import (  # noqa: E402
     OpenAlexClient,
     OpenAlexError,
     abstract_from_inverted_index,
+    publication_window_start,
     work_to_record,
 )
 
@@ -139,29 +141,15 @@ class FetchWorksTests(unittest.TestCase):
         list(client.fetch_works("S1", "2022-01-01"))
         self.assertNotIn("to_publication_date", client.calls[0]["filter"])
 
-    def test_created_date_is_used_for_incremental_fetch(self):
-        # IEEE 的 publication_date 是期號日期（2026 年整年都標 2026-01-01），
-        # 用它做增量會抓不到任何新論文，因此增量必須走 created_date。
+    def test_only_publication_date_is_used(self):
+        # created / updated 日期過濾需要付費方案（HTTP 429 + "Plan upgrade required"），
+        # 所以不該送出去，免得每天靜默失敗。
         client = FakeClient([page([], None)])
-        list(client.fetch_works("S1", "2026-09-01", date_field="created"))
+        list(client.fetch_works("S1", "2026-01-01"))
         filters = client.calls[0]["filter"]
-        self.assertIn("from_created_date:2026-09-01", filters)
-        self.assertNotIn("from_publication_date", filters)
-
-    def test_created_date_range_uses_matching_upper_bound(self):
-        client = FakeClient([page([], None)])
-        list(client.fetch_works("S1", "2026-09-01", "2026-09-06", date_field="created"))
-        self.assertIn("to_created_date:2026-09-06", client.calls[0]["filter"])
-
-    def test_publication_is_the_default_date_field(self):
-        client = FakeClient([page([], None)])
-        list(client.fetch_works("S1", "2022-01-01"))
-        self.assertIn("from_publication_date:2022-01-01", client.calls[0]["filter"])
-
-    def test_unknown_date_field_is_rejected(self):
-        client = FakeClient([page([], None)])
-        with self.assertRaises(ValueError):
-            list(client.fetch_works("S1", "2022-01-01", date_field="updated"))
+        self.assertIn("from_publication_date:2026-01-01", filters)
+        self.assertNotIn("created_date", filters)
+        self.assertNotIn("updated_date", filters)
 
     def test_abstract_field_is_requested(self):
         client = FakeClient([page([], None)])
@@ -176,6 +164,26 @@ class PolitePoolTests(unittest.TestCase):
 
     def test_user_agent_is_still_set_without_mailto(self):
         self.assertTrue(OpenAlexClient().headers["User-Agent"])
+
+
+class PublicationWindowTests(unittest.TestCase):
+    """期號日期的粒度是「年」，往回推幾天會直接把整年排除。"""
+
+    def test_the_window_snaps_back_to_the_start_of_the_year(self):
+        # 2026-09-06 往回 30 天是 2026-08-07；2026 年的論文全部標成 2026-01-01，
+        # 直接拿 2026-08-07 當起點會回傳 0 筆而且不報錯。
+        self.assertEqual(publication_window_start(date(2026, 9, 6), 30), "2026-01-01")
+
+    def test_the_new_year_window_still_covers_the_previous_year(self):
+        # 1 月剛跨年時，前一年最後才進 OpenAlex 的論文不能有空窗。
+        self.assertEqual(publication_window_start(date(2027, 1, 10), 30), "2026-01-01")
+
+    def test_a_zero_lookback_stays_in_the_current_year(self):
+        self.assertEqual(publication_window_start(date(2026, 9, 6), 0), "2026-01-01")
+
+    def test_a_negative_lookback_is_rejected(self):
+        with self.assertRaises(ValueError):
+            publication_window_start(date(2026, 9, 6), -1)
 
 
 if __name__ == "__main__":

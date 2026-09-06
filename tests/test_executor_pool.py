@@ -299,54 +299,45 @@ class PoolIdTests(unittest.TestCase):
 
 
 class JournalIngestTests(ExecutorPoolTestCase):
-    def test_daily_journal_increment_filters_on_created_date(self):
-        # IEEE 的 publication_date 是期號日期，整年標同一天；用它做增量會
-        # 回傳 0 筆而且不會報錯。
-        calls = []
-
+    def fake_client(self, captured, records=()):
         class FakeClient:
             def __init__(self, mailto=""):
                 self.mailto = mailto
 
-            def fetch_works(self, source_id, from_date, until_date=None, date_field="publication"):
-                calls.append({"source_id": source_id, "from": from_date, "field": date_field})
-                return [
-                    PaperRecord(
-                        id=f"doi:{source_id}",
-                        source="openalex",
-                        title=f"Journal {source_id}",
-                        abstract="a",
-                    )
-                ]
+            def fetch_works(self, source_id, from_date, until_date=None):
+                captured.append({"source_id": source_id, "from": from_date})
+                return list(records)
 
-        self.executor.config.pool.openalex_sources = ["S111326731"]
-        with (
-            patch("zotero_arxiv_daily.executor.OpenAlexClient", FakeClient),
-            open_pool(self.db) as pool,
-        ):
-            self.executor.ingest_daily_sources(pool)
-            self.assertEqual(pool.stats()["total"], 1)
-        self.assertEqual([c["field"] for c in calls], ["created"])
+        return FakeClient
 
-    def test_the_lookback_window_is_honoured(self):
+    def test_the_journal_window_starts_at_the_beginning_of_the_year(self):
+        # 期號日期的粒度是「年」；用 today - N 天當起點會回傳 0 筆而且不報錯。
         captured = []
-
-        class FakeClient:
-            def __init__(self, mailto=""):
-                pass
-
-            def fetch_works(self, source_id, from_date, until_date=None, date_field="publication"):
-                captured.append(from_date)
-                return []
-
         self.executor.config.pool.openalex_sources = ["S1"]
         self.executor.config.pool.journal_lookback_days = 30
         with (
-            patch("zotero_arxiv_daily.executor.OpenAlexClient", FakeClient),
+            patch("zotero_arxiv_daily.executor.OpenAlexClient", self.fake_client(captured)),
             open_pool(self.db) as pool,
         ):
             self.executor.ingest_daily_sources(pool)
-        self.assertEqual(captured, [(date.today() - timedelta(days=30)).isoformat()])
+        self.assertEqual([c["from"] for c in captured], [f"{date.today().year}-01-01"])
+
+    def test_refetched_journal_papers_are_deduplicated_by_the_pool(self):
+        # 沒有真正的增量可用，每天重抓整年；池子必須把已經有的擋掉。
+        records = [PaperRecord(id="doi:1", source="openalex", title="Journal paper", abstract="a")]
+        captured = []
+        self.executor.config.pool.openalex_sources = ["S1"]
+        with (
+            patch(
+                "zotero_arxiv_daily.executor.OpenAlexClient",
+                self.fake_client(captured, records),
+            ),
+            open_pool(self.db) as pool,
+        ):
+            self.executor.ingest_daily_sources(pool)
+            self.executor.ingest_daily_sources(pool)
+            self.assertEqual(pool.stats()["total"], 1)
+        self.assertEqual(len(captured), 2)
 
 
 class EmbeddingCredentialTests(ExecutorPoolTestCase):
