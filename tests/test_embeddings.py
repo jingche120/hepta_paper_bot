@@ -7,7 +7,13 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from embeddings import MAX_CHARS, ApiEmbedder, embed_pending, embed_texts  # noqa: E402
+from embeddings import (  # noqa: E402
+    MAX_CHARS,
+    ApiEmbedder,
+    EmbeddingResponseError,
+    embed_pending,
+    embed_texts,
+)
 from paper_pool import PaperRecord, open_pool  # noqa: E402
 
 DIM = 4
@@ -161,6 +167,65 @@ class GetEmbedderTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             get_embedder(self.config("nope"))
+
+
+class BrokenClient:
+    """回傳的 index 與送出的批次對不起來。"""
+
+    def __init__(self, indices):
+        self.indices = indices
+        self.embeddings = SimpleNamespace(create=self._create)
+
+    def _create(self, input, model):
+        return SimpleNamespace(
+            data=[
+                SimpleNamespace(index=i, embedding=[float(i), 1.0, 0.0, 0.0]) for i in self.indices
+            ]
+        )
+
+
+class ResponseIntegrityTests(unittest.TestCase):
+    """只排序不夠：缺號、重複或數量不符都會靜默把向量配到錯的論文上。"""
+
+    def test_a_missing_index_is_rejected(self):
+        # 送 2 筆只回 index 1：zip 會把它配給第 0 篇，且不會有任何錯誤。
+        with self.assertRaises(EmbeddingResponseError):
+            embed_texts(BrokenClient([1]), "m", ["a", "b"])
+
+    def test_a_duplicate_index_is_rejected(self):
+        with self.assertRaises(EmbeddingResponseError):
+            embed_texts(BrokenClient([0, 0]), "m", ["a", "b"])
+
+    def test_an_out_of_range_index_is_rejected(self):
+        with self.assertRaises(EmbeddingResponseError):
+            embed_texts(BrokenClient([0, 5]), "m", ["a", "b"])
+
+    def test_extra_vectors_are_rejected(self):
+        with self.assertRaises(EmbeddingResponseError):
+            embed_texts(BrokenClient([0, 1, 2]), "m", ["a", "b"])
+
+    def test_a_complete_response_still_passes(self):
+        self.assertEqual(len(embed_texts(BrokenClient([1, 0]), "m", ["a", "b"])), 2)
+
+
+class ShortEmbedderTests(unittest.TestCase):
+    """embed_pending 的 zip 會靜默截斷，數量不符必須擋下來。"""
+
+    class Short:
+        model = "m"
+        batch_size = 8
+
+        def embed(self, texts):
+            return [[1.0, 0.0, 0.0, 0.0]] * (len(texts) - 1)
+
+    def test_too_few_vectors_raises_and_writes_nothing(self):
+        with open_pool(":memory:") as pool:
+            pool.ingest(
+                PaperRecord(id=f"p{i}", source="s", title=f"T{i}", abstract="a") for i in range(2)
+            )
+            with self.assertRaises(EmbeddingResponseError):
+                embed_pending(pool, self.Short(), show_progress=False)
+            self.assertEqual(pool.stats()["embedded"], 0)
 
 
 if __name__ == "__main__":

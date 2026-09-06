@@ -5,11 +5,13 @@ import tempfile
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from backfill import quarter_starts  # noqa: E402
+from backfill import backfill_arxiv, backfill_journals, quarter_starts  # noqa: E402
 from paper_pool import PaperRecord, open_pool  # noqa: E402
 from zotero_arxiv_daily.retriever.arxiv_retriever import build_window_query  # noqa: E402
 
@@ -114,6 +116,106 @@ class ResumeTests(unittest.TestCase):
         with open_pool(self.path) as pool:
             row = pool._conn.execute("SELECT recommend_count FROM papers WHERE id = 'a'").fetchone()
             self.assertEqual(row["recommend_count"], 1)
+
+
+class FakeArxivRetriever:
+    """每季回傳固定筆數；指定的那一季直接拋錯，模擬下載中斷。"""
+
+    def __init__(self, fail_on=None):
+        self.fail_on = fail_on
+        self.spans = []
+
+    def _retrieve_by_date_range_between(self, span_start, span_end):
+        self.spans.append((span_start, span_end))
+        if self.fail_on and span_start >= self.fail_on:
+            raise RuntimeError("arXiv 連線中斷")
+        return [
+            SimpleNamespace(
+                url=f"https://arxiv.org/abs/{span_start}.{i}",
+                title=f"{span_start} paper {i}",
+                published=datetime(span_start.year, span_start.month, 1, tzinfo=timezone.utc),
+            )
+            for i in range(2)
+        ]
+
+    def convert_to_paper(self, result):
+        return SimpleNamespace(
+            url=result.url, title=result.title, abstract="an abstract", pdf_url=None
+        )
+
+
+class PerSpanCommitTests(unittest.TestCase):
+    """每季各自成為一個交易；否則最後一季失敗會把整趟回填一起回滾。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = str(Path(self.tmp.name) / "pool.sqlite")
+
+    def test_a_failing_quarter_keeps_the_earlier_quarters(self):
+        retriever = FakeArxivRetriever(fail_on=date(2022, 7, 1))
+        with (
+            open_pool(self.db) as pool,
+            patch("backfill.build_arxiv_retriever", return_value=retriever),
+        ):
+            with self.assertRaises(RuntimeError):
+                backfill_arxiv(pool, ["physics.geo-ph"], date(2022, 1, 1), date(2022, 12, 31))
+            # 前兩季（各 2 篇）必須留下來，重跑時才不用重抓。
+            self.assertEqual(pool.stats()["total"], 4)
+
+    def test_all_quarters_are_covered_when_nothing_fails(self):
+        retriever = FakeArxivRetriever()
+        with (
+            open_pool(self.db) as pool,
+            patch("backfill.build_arxiv_retriever", return_value=retriever),
+        ):
+            inserted, _ = backfill_arxiv(
+                pool, ["physics.geo-ph"], date(2022, 1, 1), date(2022, 12, 31)
+            )
+        self.assertEqual(len(retriever.spans), 4)
+        self.assertEqual(inserted, 8)
+
+
+class JournalRangeTests(unittest.TestCase):
+    def setUp(self):
+        self.calls = []
+
+        class FakeClient:
+            def fetch_works(inner, source_id, from_date, until_date=None, **kwargs):
+                self.calls.append((source_id, from_date, until_date))
+                return [
+                    PaperRecord(
+                        id=f"doi:{source_id}", source="openalex", title=source_id, abstract="a"
+                    )
+                ]
+
+        self.client = FakeClient()
+
+    def test_until_is_passed_through_to_openalex(self):
+        # --until 只套用到 arXiv 的話，期刊會一路抓到現在，與使用者要求的區間不符。
+        with open_pool(":memory:") as pool:
+            backfill_journals(
+                pool, self.client, {"S1": "TGRS"}, date(2022, 1, 1), date(2022, 12, 31)
+            )
+        self.assertEqual(self.calls, [("S1", "2022-01-01", "2022-12-31")])
+
+    def test_no_until_means_no_upper_bound(self):
+        # 用今天當上限會漏掉期號日期在未來的論文。
+        with open_pool(":memory:") as pool:
+            backfill_journals(pool, self.client, {"S1": "TGRS"}, date(2022, 1, 1))
+        self.assertEqual(self.calls, [("S1", "2022-01-01", None)])
+
+    def test_each_journal_is_its_own_transaction(self):
+        class Flaky:
+            def fetch_works(inner, source_id, from_date, until_date=None, **kwargs):
+                if source_id == "S2":
+                    raise RuntimeError("OpenAlex 429")
+                return [PaperRecord(id="doi:1", source="openalex", title="A", abstract="a")]
+
+        with open_pool(":memory:") as pool:
+            with self.assertRaises(RuntimeError):
+                backfill_journals(pool, Flaky(), {"S1": "TGRS", "S2": "GRSL"}, date(2022, 1, 1))
+            self.assertEqual(pool.stats()["total"], 1)
 
 
 if __name__ == "__main__":

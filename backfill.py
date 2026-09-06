@@ -49,8 +49,7 @@ def quarter_starts(start, end):
     return spans
 
 
-def arxiv_records(categories, start, end, config_overrides=None):
-    """用既有的 arXiv 檢索器逐季取回論文，轉成候選池的紀錄格式。"""
+def build_arxiv_retriever(categories, config_overrides=None):
     from omegaconf import OmegaConf
 
     from zotero_arxiv_daily.retriever.arxiv_retriever import ArxivRetriever
@@ -72,34 +71,59 @@ def arxiv_records(categories, start, end, config_overrides=None):
     )
     if config_overrides:
         config = OmegaConf.merge(config, config_overrides)
-    retriever = ArxivRetriever(config)
+    return ArxivRetriever(config)
 
+
+def arxiv_records(retriever, span_start, span_end):
+    """取回單一區間的 arXiv 論文，轉成候選池的紀錄格式。"""
+    for result in retriever._retrieve_by_date_range_between(span_start, span_end):
+        paper = retriever.convert_to_paper(result)
+        yield PaperRecord(
+            id="arxiv:" + paper.url.rsplit("/", 1)[-1],
+            source="arxiv",
+            title=paper.title,
+            abstract=paper.abstract,
+            url=paper.url,
+            pdf_url=paper.pdf_url,
+            published_date=result.published.date().isoformat()
+            if getattr(result, "published", None)
+            else None,
+        )
+
+
+def backfill_arxiv(pool, categories, start, end, config_overrides=None):
+    """逐季回填 arXiv。
+
+    每一季各自 ingest，因此各自成為一個交易。把所有季度包在同一個 ingest 裡的話，
+    第十季下載失敗會連前九季一起回滾，等於整趟回填白跑——正好違背「中斷後重跑」
+    的設計。
+    """
+    retriever = build_arxiv_retriever(categories, config_overrides)
+    inserted = skipped = 0
     for span_start, span_end in quarter_starts(start, end):
         days = (span_end - span_start).days + 1
-        results = retriever._retrieve_by_date_range_between(span_start, span_end)
-        print(f"  arXiv {span_start} ~ {span_end}（{days} 天）：{len(results)} 篇")
-        for result in results:
-            paper = retriever.convert_to_paper(result)
-            yield PaperRecord(
-                id="arxiv:" + paper.url.rsplit("/", 1)[-1],
-                source="arxiv",
-                title=paper.title,
-                abstract=paper.abstract,
-                url=paper.url,
-                pdf_url=paper.pdf_url,
-                published_date=result.published.date().isoformat()
-                if getattr(result, "published", None)
-                else None,
-            )
+        records = list(arxiv_records(retriever, span_start, span_end))
+        result = pool.ingest(records)
+        print(
+            f"  arXiv {span_start} ~ {span_end}（{days} 天）：{len(records)} 篇，"
+            f"寫入 {result.inserted}，跳過 {result.skipped}"
+        )
+        inserted += result.inserted
+        skipped += result.skipped
+    return inserted, skipped
 
 
-def journal_records(client, sources, start):
+def backfill_journals(pool, client, sources, start, end=None):
+    """逐本期刊回填，同樣讓每本各自成為一個交易。"""
+    inserted = skipped = 0
     for source_id, name in sources.items():
-        count = 0
-        for record in client.fetch_works(source_id, start.isoformat()):
-            count += 1
-            yield record
-        print(f"  {name}：{count} 篇（已扣除無摘要者）")
+        result = pool.ingest(
+            client.fetch_works(source_id, start.isoformat(), end.isoformat() if end else None)
+        )
+        print(f"  {name}：寫入 {result.inserted}，跳過 {result.skipped}（無摘要者已略過）")
+        inserted += result.inserted
+        skipped += result.skipped
+    return inserted, skipped
 
 
 def embed(pool, model, base_url, api_key, batch_size):
@@ -126,18 +150,21 @@ def run(args):
             return 0
 
         start = date.fromisoformat(args.since)
-        end = date.fromisoformat(args.until) if args.until else date.today()
+        # 只有使用者明確指定 --until 才設期刊的結束日。用今天當上限會漏掉
+        # 期號日期落在未來的論文——IEEE 的 publication_date 正是期號日期。
+        until = date.fromisoformat(args.until) if args.until else None
+        end = until or date.today()
 
         if not args.skip_arxiv:
             print(f"回填 arXiv {args.categories}…")
-            result = pool.ingest(arxiv_records(args.categories, start, end))
-            print(f"  寫入 {result.inserted}，跳過 {result.skipped}")
+            inserted, skipped = backfill_arxiv(pool, args.categories, start, end)
+            print(f"  合計寫入 {inserted}，跳過 {skipped}")
 
         if not args.skip_journals:
             print("回填 IEEE 期刊…")
             client = OpenAlexClient(mailto=args.mailto)
-            result = pool.ingest(journal_records(client, DEFAULT_JOURNALS, start))
-            print(f"  寫入 {result.inserted}，跳過 {result.skipped}")
+            inserted, skipped = backfill_journals(pool, client, DEFAULT_JOURNALS, start, until)
+            print(f"  合計寫入 {inserted}，跳過 {skipped}")
 
         if args.embed:
             print(f"計算向量（模型 {args.embed_model}）…")

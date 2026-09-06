@@ -298,5 +298,84 @@ class PoolIdTests(unittest.TestCase):
         self.assertEqual(paper.score, 1.5)
 
 
+class JournalIngestTests(ExecutorPoolTestCase):
+    def test_daily_journal_increment_filters_on_created_date(self):
+        # IEEE 的 publication_date 是期號日期，整年標同一天；用它做增量會
+        # 回傳 0 筆而且不會報錯。
+        calls = []
+
+        class FakeClient:
+            def __init__(self, mailto=""):
+                self.mailto = mailto
+
+            def fetch_works(self, source_id, from_date, until_date=None, date_field="publication"):
+                calls.append({"source_id": source_id, "from": from_date, "field": date_field})
+                return [
+                    PaperRecord(
+                        id=f"doi:{source_id}",
+                        source="openalex",
+                        title=f"Journal {source_id}",
+                        abstract="a",
+                    )
+                ]
+
+        self.executor.config.pool.openalex_sources = ["S111326731"]
+        with (
+            patch("zotero_arxiv_daily.executor.OpenAlexClient", FakeClient),
+            open_pool(self.db) as pool,
+        ):
+            self.executor.ingest_daily_sources(pool)
+            self.assertEqual(pool.stats()["total"], 1)
+        self.assertEqual([c["field"] for c in calls], ["created"])
+
+    def test_the_lookback_window_is_honoured(self):
+        captured = []
+
+        class FakeClient:
+            def __init__(self, mailto=""):
+                pass
+
+            def fetch_works(self, source_id, from_date, until_date=None, date_field="publication"):
+                captured.append(from_date)
+                return []
+
+        self.executor.config.pool.openalex_sources = ["S1"]
+        self.executor.config.pool.journal_lookback_days = 30
+        with (
+            patch("zotero_arxiv_daily.executor.OpenAlexClient", FakeClient),
+            open_pool(self.db) as pool,
+        ):
+            self.executor.ingest_daily_sources(pool)
+        self.assertEqual(captured, [(date.today() - timedelta(days=30)).isoformat()])
+
+
+class EmbeddingCredentialTests(ExecutorPoolTestCase):
+    def test_the_llm_client_is_never_used_for_embeddings(self):
+        # embedding 走 reranker.api.*（EMBEDDING_*），與 LLM 的 OPENAI_* 是分開的。
+        # 傳錯 client 只會用到錯的金鑰與端點，不會有任何錯誤訊息。
+        self.executor.openai_client = object()
+        self.seed([("o1", "Old", "aaa", "2022-01-01")])
+        calls = []
+
+        def spy(*args, **kwargs):
+            calls.append((args, kwargs))
+            return FakeEmbedder()
+
+        with (
+            patch.object(Executor, "fetch_reading_history", return_value=self.history),
+            patch("zotero_arxiv_daily.executor.get_embedder", side_effect=spy),
+            patch("zotero_arxiv_daily.executor.send_email"),
+            patch("zotero_arxiv_daily.executor.render_email", return_value="<html/>"),
+            patch.object(Executor, "fetch_full_texts"),
+            patch.object(Paper, "generate_tldr"),
+            patch.object(Paper, "generate_affiliations"),
+        ):
+            self.executor.run()
+        self.assertEqual(len(calls), 1)
+        args, kwargs = calls[0]
+        self.assertEqual(args, (self.config,))
+        self.assertEqual(kwargs, {})
+
+
 if __name__ == "__main__":
     unittest.main()

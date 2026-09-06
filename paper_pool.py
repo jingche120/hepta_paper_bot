@@ -13,12 +13,15 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
+from loguru import logger
 
 EMBEDDING_DTYPE = np.float32
 # 與 reranker/base.py 的分數尺度一致，方便兩邊的數值互相比對。
 SCORE_SCALE = 10
 
-SCHEMA = """
+# 單獨留一份 CREATE TABLE，重建舊資料表時要用（executescript 會隱含 commit，
+# 不能在交易中途呼叫）。
+PAPERS_TABLE = """
 CREATE TABLE IF NOT EXISTS papers(
   id TEXT PRIMARY KEY,
   norm_title TEXT,
@@ -34,12 +37,21 @@ CREATE TABLE IF NOT EXISTS papers(
   recommend_count INTEGER NOT NULL DEFAULT 0,
   last_recommended_at TEXT,
   carded INTEGER NOT NULL DEFAULT 0
-);
--- UNIQUE 讓「同一篇論文只進池一次」由資料庫保證，而不是靠應用層的先查再寫。
--- 標題無法正規化者存 NULL；SQLite 的 UNIQUE 允許多個 NULL，因此不會互撞。
-CREATE UNIQUE INDEX IF NOT EXISTS idx_papers_norm_title ON papers(norm_title);
-CREATE INDEX IF NOT EXISTS idx_papers_pending ON papers(carded, embedding_model);
+)
 """
+
+UNIQUE_TITLE_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS idx_papers_norm_title ON papers(norm_title)"
+PENDING_INDEX = "CREATE INDEX IF NOT EXISTS idx_papers_pending ON papers(carded, embedding_model)"
+
+# UNIQUE 讓「同一篇論文只進池一次」由資料庫保證，而不是靠應用層的先查再寫。
+# 標題無法正規化者存 NULL；SQLite 的 UNIQUE 允許多個 NULL，因此不會互撞。
+SCHEMA = f"{PAPERS_TABLE};\n{UNIQUE_TITLE_INDEX};\n{PENDING_INDEX};"
+
+# 重建資料表時要逐欄搬移，避免依賴欄位順序。
+PAPER_COLUMNS = (
+    "id, norm_title, source, title, abstract, url, pdf_url, published_date,"
+    " added_at, embedding, embedding_model, recommend_count, last_recommended_at, carded"
+)
 
 
 class PaperPoolError(RuntimeError):
@@ -68,6 +80,10 @@ def _l2_normalize(array):
     OpenAI 的 embedding 恰好已正規化，但本機模型與未來的來源不保證如此，
     因此在寫入與合成質心時強制正規化，讓這個前提由結構保證而非呼叫端自律。
     """
+    if not np.all(np.isfinite(array)):
+        # NaN / Infinity 除下去仍是 NaN，會一路傳到分數，讓排序變成沒有意義的
+        # 亂序卻不報錯。在入口擋掉，池中的向量才真的都是單位向量。
+        raise ValueError("向量含有 NaN 或 Infinity，無法正規化。")
     norms = np.linalg.norm(array, axis=-1, keepdims=True)
     if np.any(norms == 0):
         raise ValueError("零向量無法正規化。")
@@ -150,6 +166,90 @@ class PaperPool:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
+        for note in self._migrate():
+            logger.info(f"候選池 schema 升級：{note}")
+
+    # ---------- schema 升級 ----------
+
+    def _migrate(self):
+        """把舊版候選池升級成目前的 schema，回傳做過的事。
+
+        `CREATE UNIQUE INDEX IF NOT EXISTS` 只看名稱存不存在，不看它是不是 UNIQUE。
+        早期版本建的 `idx_papers_norm_title` 是非 UNIQUE 的，於是既有資料庫會**靜默**
+        沿用舊索引，拿不到「同一篇論文只進池一次」的保證；同期的 `norm_title` 還是
+        NOT NULL，無法正規化的標題會直接寫入失敗。兩者都不會有錯誤訊息。
+
+        `normalize_title()` 的規則也改過（舊版保留連字號與空白），舊資料算出來的
+        norm_title 與現在對不起來，比對已讀卡片會失敗，因此一併重算。
+        """
+        columns = {row["name"]: row for row in self._conn.execute("PRAGMA table_info(papers)")}
+        if not columns:
+            return []
+        index = next(
+            (
+                row
+                for row in self._conn.execute("PRAGMA index_list(papers)")
+                if row["name"] == "idx_papers_norm_title"
+            ),
+            None,
+        )
+        needs_null = bool(columns["norm_title"]["notnull"])
+        if index is not None and index["unique"] and not needs_null:
+            return []
+
+        notes = []
+        self._conn.create_function("norm_title_of", 1, lambda t: normalize_title(t) or None)
+        with self._conn:
+            self._conn.execute("DROP INDEX IF EXISTS idx_papers_norm_title")
+            if needs_null:
+                # 先放寬欄位，下面重算才寫得進 NULL。
+                self._rebuild_papers_table()
+                notes.append("norm_title 改為允許 NULL")
+            self._conn.execute("UPDATE papers SET norm_title = norm_title_of(title)")
+            removed = self._drop_duplicate_titles()
+            if removed:
+                notes.append(f"移除 {len(removed)} 筆重複標題（保留狀態最完整的一筆）：{removed}")
+            self._conn.execute(UNIQUE_TITLE_INDEX)
+            notes.append("idx_papers_norm_title 升級為 UNIQUE")
+        return notes
+
+    def _rebuild_papers_table(self):
+        """SQLite 不能修改欄位的 NOT NULL，只能整張重建。"""
+        self._conn.execute("DROP INDEX IF EXISTS idx_papers_pending")
+        self._conn.execute("ALTER TABLE papers RENAME TO papers_legacy")
+        self._conn.execute(PAPERS_TABLE)
+        self._conn.execute(
+            f"INSERT INTO papers ({PAPER_COLUMNS}) SELECT {PAPER_COLUMNS} FROM papers_legacy"
+        )
+        self._conn.execute("DROP TABLE papers_legacy")
+        self._conn.execute(PENDING_INDEX)
+
+    def _drop_duplicate_titles(self):
+        """同一個正規化標題只留一筆，否則 UNIQUE 索引建不起來。
+
+        留下狀態最完整的那筆（已寫成卡片 > 推薦過 > 已有向量 > 先進池的）。
+        丟掉的是同一篇論文的另一個版本，內容重複；但仍回報 id，
+        因為刪資料不該無聲無息。
+        """
+        removed = []
+        duplicates = self._conn.execute(
+            "SELECT norm_title FROM papers WHERE norm_title IS NOT NULL"
+            " GROUP BY norm_title HAVING COUNT(*) > 1"
+        ).fetchall()
+        for row in duplicates:
+            ids = [
+                r["id"]
+                for r in self._conn.execute(
+                    "SELECT id FROM papers WHERE norm_title = ?"
+                    " ORDER BY carded DESC, recommend_count DESC,"
+                    " (embedding IS NOT NULL) DESC, added_at ASC, id ASC",
+                    (row["norm_title"],),
+                )
+            ]
+            for paper_id in ids[1:]:
+                self._conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+                removed.append(paper_id)
+        return removed
 
     def __enter__(self):
         return self
@@ -246,8 +346,10 @@ class PaperPool:
                 )
                 if cursor.rowcount == 0:
                     missing.append(paper_id)
-        if missing:
-            raise PaperPoolError(f"這些 id 不在池中，向量沒有寫入：{missing}")
+            if missing:
+                # 在 with 區塊**之內**拋出，整批才會回滾。若等離開區塊再拋，
+                # 有效的那幾筆已經 commit，錯誤訊息卻讓呼叫端以為整批都沒寫入。
+                raise PaperPoolError(f"這些 id 不在池中，整批向量都沒有寫入：{missing}")
 
     def mark_recommended(self, papers, when=None):
         """把選出的論文計入推薦次數。這是輪替機制的依據。

@@ -455,5 +455,164 @@ class StatsTests(PoolTestCase):
         self.assertEqual(self.pool.stats()["total"], 0)
 
 
+LEGACY_SCHEMA = """
+CREATE TABLE papers(
+  id TEXT PRIMARY KEY,
+  norm_title TEXT NOT NULL,
+  source TEXT NOT NULL,
+  title TEXT NOT NULL,
+  abstract TEXT NOT NULL,
+  url TEXT,
+  pdf_url TEXT,
+  published_date TEXT,
+  added_at TEXT NOT NULL,
+  embedding BLOB,
+  embedding_model TEXT,
+  recommend_count INTEGER NOT NULL DEFAULT 0,
+  last_recommended_at TEXT,
+  carded INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_papers_norm_title ON papers(norm_title);
+CREATE INDEX idx_papers_pending ON papers(carded, embedding_model);
+"""
+
+
+def legacy_norm_title(title):
+    """v2 早期的正規化：只小寫，保留連字號與空白。"""
+    return title.lower()
+
+
+class MigrationTests(unittest.TestCase):
+    """舊資料庫必須真的被升級。
+
+    `CREATE UNIQUE INDEX IF NOT EXISTS` 只看名稱，不看 UNIQUE 旗標；早期版本
+    建的是同名的非 UNIQUE 索引，於是既有資料庫會靜默沿用舊索引，
+    A3 的原子去重保證形同虛設。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db = str(Path(self.tmp.name) / "legacy.sqlite")
+
+    def legacy(self, rows):
+        conn = sqlite3.connect(self.db)
+        conn.executescript(LEGACY_SCHEMA)
+        conn.executemany(
+            "INSERT INTO papers (id, norm_title, source, title, abstract, url, added_at,"
+            " embedding, embedding_model, recommend_count, carded)"
+            " VALUES (?, ?, 'arxiv', ?, 'a', '', '2026-01-01', ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
+        conn.close()
+
+    def index_is_unique(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            return next(
+                row[2]
+                for row in conn.execute("PRAGMA index_list(papers)")
+                if row[1] == "idx_papers_norm_title"
+            )
+        finally:
+            conn.close()
+
+    def test_a_non_unique_index_is_upgraded(self):
+        self.legacy([("a1", legacy_norm_title("Alpha"), "Alpha", None, None, 0, 0)])
+        self.assertEqual(self.index_is_unique(), 0)
+        with open_pool(self.db):
+            pass
+        self.assertEqual(self.index_is_unique(), 1)
+
+    def test_the_upgraded_index_actually_blocks_duplicates(self):
+        self.legacy([("a1", legacy_norm_title("Alpha Beta"), "Alpha Beta", None, None, 0, 0)])
+        with open_pool(self.db) as pool:
+            # 同一篇論文的另一個版本，標點不同但正規化後相同。
+            result = pool.ingest(
+                [PaperRecord(id="doi:1", source="openalex", title="Alpha-Beta", abstract="a")]
+            )
+            self.assertEqual(result.inserted, 0)
+            self.assertEqual(result.skipped_title, 1)
+
+    def test_norm_title_becomes_nullable(self):
+        # 舊 schema 的 NOT NULL 會讓「標題無法正規化」的論文整批寫入失敗。
+        self.legacy([("a1", legacy_norm_title("Alpha"), "Alpha", None, None, 0, 0)])
+        with open_pool(self.db) as pool:
+            result = pool.ingest([PaperRecord(id="x1", source="s", title="。。。", abstract="a")])
+            self.assertEqual(result.inserted, 1)
+
+    def test_norm_titles_are_recomputed_with_the_current_rules(self):
+        # 舊值是 "edgephase: ... multi‐station ..."，與現行算法對不起來，
+        # 比對已讀卡片會失敗而重複推薦。
+        self.legacy([("a1", legacy_norm_title(EDGEPHASE_ARXIV), EDGEPHASE_ARXIV, None, None, 0, 0)])
+        with open_pool(self.db) as pool:
+            self.assertEqual(pool.mark_carded([EDGEPHASE_CARD]), [])
+            row = pool._conn.execute("SELECT carded FROM papers WHERE id='a1'").fetchone()
+            self.assertEqual(row["carded"], 1)
+
+    def test_duplicates_are_resolved_keeping_the_most_complete_row(self):
+        blob = unit(1).tobytes()
+        self.legacy(
+            [
+                ("plain", "alpha", "Alpha", None, None, 0, 0),
+                ("embedded", "alpha", "Alpha", blob, "m", 0, 0),
+                ("carded", "alpha", "Alpha", None, None, 3, 1),
+            ]
+        )
+        with open_pool(self.db) as pool:
+            ids = [r["id"] for r in pool._conn.execute("SELECT id FROM papers")]
+        # 已寫成卡片的那筆狀態最完整，必須留下來，否則那篇論文會被重新推薦。
+        self.assertEqual(ids, ["carded"])
+
+    def test_accumulated_state_survives_the_upgrade(self):
+        blob = unit(2).tobytes()
+        self.legacy([("a1", "alpha", "Alpha", blob, "m", 5, 1)])
+        with open_pool(self.db) as pool:
+            row = pool._conn.execute("SELECT * FROM papers WHERE id='a1'").fetchone()
+        self.assertEqual(row["recommend_count"], 5)
+        self.assertEqual(row["carded"], 1)
+        self.assertEqual(row["embedding_model"], "m")
+        self.assertEqual(row["embedding"], blob)
+
+    def test_reopening_a_current_database_changes_nothing(self):
+        with open_pool(self.db) as pool:
+            pool.ingest([PaperRecord(id="a1", source="s", title="Alpha", abstract="a")])
+        with open_pool(self.db) as pool:
+            self.assertEqual(pool.stats()["total"], 1)
+        self.assertEqual(self.index_is_unique(), 1)
+
+
+class NonFiniteVectorTests(unittest.TestCase):
+    """NaN 與 Infinity 除下去仍是 NaN，會讓分數變成沒有意義的亂序卻不報錯。"""
+
+    def test_infinity_is_rejected(self):
+        with open_pool(":memory:") as pool:
+            pool.ingest([PaperRecord(id="p1", source="s", title="T", abstract="a")])
+            with self.assertRaises(ValueError):
+                pool.store_embeddings([("p1", [float("inf")] + [0.0] * (DIM - 1))], "m")
+            self.assertEqual(pool.stats()["embedded"], 0)
+
+    def test_nan_is_rejected(self):
+        with open_pool(":memory:") as pool:
+            pool.ingest([PaperRecord(id="p1", source="s", title="T", abstract="a")])
+            with self.assertRaises(ValueError):
+                pool.store_embeddings([("p1", [float("nan")] + [1.0] * (DIM - 1))], "m")
+
+    def test_a_non_finite_history_vector_is_rejected(self):
+        with self.assertRaises(ValueError):
+            weighted_centroid([[float("nan")] * DIM])
+
+
+class StoreEmbeddingsRollbackTests(unittest.TestCase):
+    def test_an_unknown_id_rolls_back_the_whole_batch(self):
+        # 拋錯前先 commit 有效的那幾筆，會讓呼叫端以為整批沒寫入，實際卻寫了一半。
+        with open_pool(":memory:") as pool:
+            pool.ingest([PaperRecord(id="known", source="s", title="T", abstract="a")])
+            with self.assertRaises(PaperPoolError):
+                pool.store_embeddings([("known", unit(3)), ("missing", unit(4))], "m")
+            self.assertEqual(pool.stats()["embedded"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,29 @@ DEFAULT_BATCH_SIZE = 64
 MAX_CHARS = 20000
 
 
+class EmbeddingResponseError(RuntimeError):
+    """embedding 回應與送出的批次對不起來。"""
+
+
+def _ordered_embeddings(data, expected):
+    """把回應排回輸入順序，並確認每一筆都回來了。
+
+    API 不保證回傳順序，所以要依 index 排序；但只排序不夠。少回一筆、index 重複
+    或缺號時，呼叫端的 zip 會把向量配到**錯的論文**上，而且完全不會報錯——
+    錯誤的向量會就此永久存進池子，之後每天都用它來評分。
+
+    因此這裡要求 index 恰好是 0..n-1 的完整集合，不符就整批失敗。
+    重跑一批的代價遠低於靜默寫入錯誤資料。
+    """
+    items = list(data)
+    indices = sorted(item.index for item in items)
+    if indices != list(range(expected)):
+        raise EmbeddingResponseError(
+            f"embedding API 送出 {expected} 筆卻回傳 index {indices}，無法確定向量對應哪一篇論文。"
+        )
+    return [item.embedding for item in sorted(items, key=lambda item: item.index)]
+
+
 def embed_texts(client, model, texts, batch_size=DEFAULT_BATCH_SIZE):
     """分批向 OpenAI 相容 API 取得向量，回傳順序與輸入一致。"""
     if batch_size < 1:
@@ -21,10 +44,7 @@ def embed_texts(client, model, texts, batch_size=DEFAULT_BATCH_SIZE):
     for start in range(0, len(texts), batch_size):
         batch = [text[:MAX_CHARS] for text in texts[start : start + batch_size]]
         response = client.embeddings.create(input=batch, model=model)
-        # API 不保證回傳順序，依 index 排回原順序。錯位會把向量配到錯的論文上，
-        # 而且不會有任何錯誤訊息。
-        ordered = sorted(response.data, key=lambda item: item.index)
-        vectors.extend(item.embedding for item in ordered)
+        vectors.extend(_ordered_embeddings(response.data, len(batch)))
     return vectors
 
 
@@ -112,6 +132,12 @@ def embed_pending(pool, embedder, batch_size=None, show_progress=True):
     for start in batches:
         chunk = pending[start : start + batch_size]
         vectors = embedder.embed([abstract for _, abstract in chunk])
+        # 下面的 zip 會靜默截斷，數量不符時前面的論文會拿到別人的向量。
+        # 這道檢查同時涵蓋本機 embedder，不只 API。
+        if len(vectors) != len(chunk):
+            raise EmbeddingResponseError(
+                f"這批有 {len(chunk)} 篇論文，embedder 卻回傳 {len(vectors)} 個向量。"
+            )
         # 每批寫入後即提交，中斷時已算好的向量不會白費。
         pool.store_embeddings(
             ((paper_id, vector) for (paper_id, _), vector in zip(chunk, vectors)), model
