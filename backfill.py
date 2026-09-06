@@ -23,7 +23,7 @@ for path in (ROOT, ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from embeddings import embed_pending  # noqa: E402
+from embeddings import ApiEmbedder, embed_pending  # noqa: E402
 from openalex import GRSL, TGRS, OpenAlexClient  # noqa: E402
 from paper_pool import PaperRecord, open_pool  # noqa: E402
 
@@ -112,7 +112,7 @@ def embed(pool, model, base_url, api_key, batch_size):
             "或改用 --embed-key 傳入。"
         )
     client = OpenAI(api_key=api_key, base_url=base_url or None)
-    done = embed_pending(pool, client, model, batch_size)
+    done = embed_pending(pool, ApiEmbedder(client, model, batch_size))
     print(f"  計算了 {done} 篇的向量")
 
 

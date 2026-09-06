@@ -1,12 +1,15 @@
 from loguru import logger
 from omegaconf import DictConfig, ListConfig
+from embeddings import embed_pending, get_embedder
 from heptabase_reading_history import load_reading_history
+from openalex import OpenAlexClient
+from paper_pool import PaperRecord, open_pool, weighted_centroid
 from .utils import glob_match
 from .retriever import get_retriever_cls
 from .protocol import CorpusPaper, Paper
 import random
+from datetime import date, timedelta
 from time import sleep
-from .reranker import get_reranker_cls
 from .construct_email import render_email
 from .utils import send_email
 from openai import OpenAI
@@ -37,7 +40,6 @@ class Executor:
         self.retrievers = {
             source: get_retriever_cls(source)(config) for source in config.executor.source
         }
-        self.reranker = get_reranker_cls(config.executor.reranker)(config)
         self.openai_client = OpenAI(api_key=config.llm.api.key, base_url=config.llm.api.base_url)
     def fetch_reading_history(self) -> list[CorpusPaper]:
         reading_history_path = self.config.heptabase.reading_history_path
@@ -79,16 +81,73 @@ class Executor:
         return history
 
 
-    def fetch_full_texts(self, papers:list[Paper]) -> None:
-        """Download full text for the papers that survived reranking.
+    def ingest_daily_sources(self, pool) -> None:
+        """把當日檢索到的論文存進池子，而不是用完即丟。
 
-        Only TLDR and affiliation generation read full_text, and only these top papers reach
-        that stage, so fetching earlier would download a whole day of papers to throw most away.
+        v1 每天寄完信就把候選丟掉，沒讀完的推薦隔天就消失。存進池子後，
+        沒被選上的論文留在池中等下次機會，直到寫成卡片為止。
         """
-        logger.info(f"Downloading full text of the top {len(papers)} papers...")
+        for source, retriever in self.retrievers.items():
+            logger.info(f"Retrieving {source} papers...")
+            papers = retriever.retrieve_papers()
+            result = pool.ingest(
+                PaperRecord(
+                    id=self._pool_id(p),
+                    source=p.source,
+                    title=p.title,
+                    abstract=p.abstract,
+                    url=p.url,
+                    pdf_url=p.pdf_url,
+                    published_date=retriever.published_date(p),
+                )
+                for p in papers
+            )
+            logger.info(f"{source}: {len(papers)} retrieved, {result.inserted} new to the pool")
+
+        journals = self.config.pool.get("openalex_sources") or []
+        if journals:
+            client = OpenAlexClient(mailto=self.config.pool.get("openalex_mailto") or "")
+            # IEEE 的 publication_date 是期號日期（整年都標同一天），用它做增量
+            # 會抓不到任何新論文，因此增量一律走 created_date。
+            since = (date.today() - timedelta(days=self.config.pool.journal_lookback_days)).isoformat()
+            for source_id in journals:
+                works = list(client.fetch_works(source_id, since, date_field="created"))
+                result = pool.ingest(works)
+                logger.info(f"{source_id}: {len(works)} fetched, {result.inserted} new to the pool")
+
+    @staticmethod
+    def _pool_id(paper:Paper) -> str:
+        """把論文網址轉成池中的識別碼。"""
+        return f"{paper.source}:{(paper.url or paper.title).rsplit('/', 1)[-1]}"
+
+    @staticmethod
+    def _to_paper(pooled) -> Paper:
+        source = pooled.id.split(":", 1)[0]
+        return Paper(
+            source=source,
+            title=pooled.title,
+            authors=[],
+            abstract=pooled.abstract,
+            url=pooled.url,
+            pdf_url=pooled.pdf_url,
+            score=pooled.score,
+        )
+
+    def fetch_full_texts(self, papers:list[Paper]) -> None:
+        """Download full text for the papers that survived selection.
+
+        Only TLDR and affiliation generation read full_text, and only these few papers
+        reach that stage, so fetching earlier would download a whole day of papers to
+        throw most away. Sources without a retriever (journal articles behind a paywall)
+        simply keep full_text None and fall back to the abstract.
+        """
+        logger.info(f"Downloading full text of {len(papers)} papers...")
         for paper in tqdm(papers, desc="Fetching full text"):
+            retriever = self.retrievers.get(paper.source)
+            if retriever is None:
+                continue
             try:
-                paper.full_text = self.retrievers[paper.source].fetch_full_text(paper)
+                paper.full_text = retriever.fetch_full_text(paper)
             except Exception as exc:
                 logger.warning(f"Failed to fetch full text of {paper.url}: {exc}")
                 paper.full_text = None
@@ -100,30 +159,55 @@ class Executor:
         if len(history) == 0:
             logger.error(f"No reading history found. Please check your heptabase settings:\n{self.config.heptabase}")
             return
-        all_papers = []
-        for source, retriever in self.retrievers.items():
-            logger.info(f"Retrieving {source} papers...")
-            papers = retriever.retrieve_papers()
-            if len(papers) == 0:
-                logger.info(f"No {source} papers found")
-                continue
-            logger.info(f"Retrieved {len(papers)} {source} papers")
-            all_papers.extend(papers)
-        logger.info(f"Total {len(all_papers)} papers retrieved from all sources")
-        reranked_papers = []
-        if len(all_papers) > 0:
-            logger.info("Reranking papers...")
-            reranked_papers = self.reranker.rerank(all_papers, history)
-            reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
-            self.fetch_full_texts(reranked_papers)
+
+        pool = open_pool(self.config.pool.db_path)
+        try:
+            self.ingest_daily_sources(pool)
+
+            unmatched = pool.mark_carded(history)
+            if unmatched:
+                logger.warning(
+                    "These cards matched no paper in the pool, so those papers may be "
+                    f"recommended again. Fix the 來源論文 line on each: {unmatched}"
+                )
+
+            # embedding 走 reranker.api.*（EMBEDDING_*），與 LLM 的憑證是分開的。
+            embedder = get_embedder(self.config)
+            computed = embed_pending(pool, embedder)
+            logger.info(f"Embedded {computed} new papers; pool now {pool.stats()}")
+
+            # time_decay_weights 假設順序是新到舊；不排序會讓最舊的卡片拿到最高權重。
+            recent_first = sorted(history, key=lambda h: h.added_date, reverse=True)
+            centroid = weighted_centroid(embedder.embed([h.abstract for h in recent_first]))
+            selected = pool.select(
+                centroid,
+                n_new=self.config.pool.n_new,
+                n_old=self.config.pool.n_old,
+                new_within_days=self.config.pool.new_within_days,
+                model=embedder.model,
+            )
+            logger.info(f"Selected {len(selected)} papers")
+            if len(selected) == 0 and not self.config.executor.send_empty:
+                logger.info("Nothing to recommend. No email will be sent.")
+                return
+
+            papers = [self._to_paper(p) for p in selected]
+            self.fetch_full_texts(papers)
             logger.info("Generating TLDR and affiliations...")
-            for p in tqdm(reranked_papers):
+            for p in tqdm(papers):
                 p.generate_tldr(self.openai_client, self.config.llm)
                 p.generate_affiliations(self.openai_client, self.config.llm)
-        elif not self.config.executor.send_empty:
-            logger.info("No new papers found. No email will be sent.")
-            return
-        logger.info("Sending email...")
-        email_content = render_email(reranked_papers)
-        send_email(self.config, email_content)
-        logger.info("Email sent successfully")
+
+            if self.config.executor.get("dry_run"):
+                for p in papers:
+                    logger.info(f"{p.score:7.3f}  {p.title}")
+                logger.info("dry_run is on; no email sent and nothing marked as recommended.")
+                return
+
+            logger.info("Sending email...")
+            send_email(self.config, render_email(papers))
+            logger.info("Email sent successfully")
+            # 寄出成功才計入推薦次數，否則寄信失敗會讓這些論文白白排到隊伍後方。
+            pool.mark_recommended(selected)
+        finally:
+            pool.close()

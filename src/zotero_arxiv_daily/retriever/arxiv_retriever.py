@@ -134,6 +134,30 @@ def build_window_query(categories: list[str], start, end) -> str:
     return f"({cat_query}) AND submittedDate:[{start:%Y%m%d%H%M} TO {end:%Y%m%d%H%M}]"
 
 
+class _ArxivRef:
+    """Stand-in for an arxiv.Result, built from a stored URL.
+
+    Papers selected from the persistent pool were retrieved on an earlier run, so the
+    API results cached in _raw_by_url are gone. The extraction helpers only need the
+    source URL, entry id and title, and all three are derivable from the abs URL.
+    """
+
+    def __init__(self, entry_id: str, title: str, pdf_url: str | None):
+        self.entry_id = entry_id
+        self.title = title
+        self.pdf_url = pdf_url or f"https://arxiv.org/pdf/{entry_id.rsplit('/', 1)[-1]}"
+
+    def source_url(self) -> str:
+        return f"https://arxiv.org/e-print/{self.entry_id.rsplit('/', 1)[-1]}"
+
+
+def _arxiv_ref(paper: Paper) -> "_ArxivRef | None":
+    url = paper.url or ""
+    if "arxiv.org/abs/" not in url:
+        return None
+    return _ArxivRef(url, paper.title, paper.pdf_url)
+
+
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
@@ -255,10 +279,15 @@ class ArxivRetriever(BaseRetriever):
             full_text=None,
         )
 
-    def fetch_full_text(self, paper: Paper) -> str | None:
+    def published_date(self, paper: Paper) -> str | None:
         raw_paper = self._raw_by_url.get(paper.url)
+        published = getattr(raw_paper, "published", None)
+        return published.date().isoformat() if published else None
+
+    def fetch_full_text(self, paper: Paper) -> str | None:
+        raw_paper = self._raw_by_url.get(paper.url) or _arxiv_ref(paper)
         if raw_paper is None:
-            logger.warning(f"No arxiv result cached for {paper.url}; skipping full text.")
+            logger.warning(f"Cannot derive an arxiv source URL for {paper.url}; no full text.")
             return None
         full_text = extract_text_from_tar(raw_paper)
         if full_text is None:

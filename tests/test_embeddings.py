@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from embeddings import MAX_CHARS, embed_pending, embed_texts  # noqa: E402
+from embeddings import MAX_CHARS, ApiEmbedder, embed_pending, embed_texts  # noqa: E402
 from paper_pool import PaperRecord, open_pool  # noqa: E402
 
 DIM = 4
@@ -75,21 +75,27 @@ class EmbedPendingTests(unittest.TestCase):
 
     def test_all_pending_papers_get_vectors(self):
         client = FakeClient()
-        self.assertEqual(embed_pending(self.pool, client, "m", 2, show_progress=False), 5)
+        self.assertEqual(
+            embed_pending(self.pool, ApiEmbedder(client, "m", 2), show_progress=False), 5
+        )
         self.assertEqual(self.pool.stats()["pending_embedding"], 0)
 
     def test_second_run_computes_nothing(self):
         client = FakeClient()
-        embed_pending(self.pool, client, "m", 2, show_progress=False)
+        embed_pending(self.pool, ApiEmbedder(client, "m", 2), show_progress=False)
         before = len(client.calls)
-        self.assertEqual(embed_pending(self.pool, client, "m", 2, show_progress=False), 0)
+        self.assertEqual(
+            embed_pending(self.pool, ApiEmbedder(client, "m", 2), show_progress=False), 0
+        )
         # 沒有新的 API 呼叫：這是每天的成本控制關鍵。
         self.assertEqual(len(client.calls), before)
 
     def test_changing_model_recomputes_everything(self):
         client = FakeClient()
-        embed_pending(self.pool, client, "m1", 5, show_progress=False)
-        self.assertEqual(embed_pending(self.pool, client, "m2", 5, show_progress=False), 5)
+        embed_pending(self.pool, ApiEmbedder(client, "m1", 5), show_progress=False)
+        self.assertEqual(
+            embed_pending(self.pool, ApiEmbedder(client, "m2", 5), show_progress=False), 5
+        )
 
     def test_vectors_land_on_the_right_papers(self):
         # abstract "abstract 0" 長度 10、"abstract 4" 也是 10，改用不同長度來分辨。
@@ -101,7 +107,7 @@ class EmbedPendingTests(unittest.TestCase):
                 PaperRecord(id="long", source="arxiv", title="B", abstract="abcdef"),
             ]
         )
-        embed_pending(pool, FakeClient(shuffle=True), "m", 2, show_progress=False)
+        embed_pending(pool, ApiEmbedder(FakeClient(shuffle=True), "m", 2), show_progress=False)
         picked = {p.id: p for p in pool.select([1.0, 0.0, 0.0, 0.0], 0, 2, 7)}
         # 向量第一維等於摘要長度，正規化後長度較長者的分數較高。
         self.assertGreater(picked["long"].score, picked["short"].score)
@@ -110,8 +116,51 @@ class EmbedPendingTests(unittest.TestCase):
         pool = open_pool(":memory:")
         self.addCleanup(pool.close)
         client = FakeClient()
-        self.assertEqual(embed_pending(pool, client, "m", show_progress=False), 0)
+        self.assertEqual(embed_pending(pool, ApiEmbedder(client, "m"), show_progress=False), 0)
         self.assertEqual(client.calls, [])
+
+
+class GetEmbedderTests(unittest.TestCase):
+    def config(self, kind):
+        from omegaconf import OmegaConf
+
+        return OmegaConf.create(
+            {
+                "executor": {"reranker": kind},
+                "reranker": {
+                    "api": {
+                        "key": "k",
+                        "base_url": None,
+                        "model": "text-embedding-3-small",
+                        "batch_size": 32,
+                    },
+                    "local": {"model": "some/model", "encode_kwargs": {"task": "retrieval"}},
+                },
+            }
+        )
+
+    def test_api_embedder_uses_the_embedding_credentials(self):
+        from embeddings import ApiEmbedder, get_embedder
+
+        client = FakeClient()
+        embedder = get_embedder(self.config("api"), client)
+        self.assertIsInstance(embedder, ApiEmbedder)
+        self.assertEqual(embedder.model, "text-embedding-3-small")
+        self.assertEqual(embedder.batch_size, 32)
+
+    def test_local_embedder_is_namespaced_to_avoid_clashing_with_api_models(self):
+        # 池中以模型名判斷向量是否需要重算；本機與 API 同名模型不可混為一談。
+        from embeddings import LocalEmbedder, get_embedder
+
+        embedder = get_embedder(self.config("local"))
+        self.assertIsInstance(embedder, LocalEmbedder)
+        self.assertEqual(embedder.model, "local:some/model")
+
+    def test_unknown_kind_is_rejected(self):
+        from embeddings import get_embedder
+
+        with self.assertRaises(ValueError):
+            get_embedder(self.config("nope"))
 
 
 if __name__ == "__main__":

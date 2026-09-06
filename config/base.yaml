@@ -45,9 +45,20 @@ reranker:
     model: ${oc.env:EMBEDDING_MODEL,null}
     batch_size: null # 依供應商上限調整。範例: 64
 
+pool:
+  db_path: data/paper_pool.sqlite # 候選池。相對路徑以專案根目錄為基準。
+  n_new: 2 # 每天推薦幾篇「新」論文。
+  n_old: 1 # 每天推薦幾篇池中的舊論文。這是回填的價值所在。
+  new_within_days: 7 # 發表日在幾天內算「新」。注意 IEEE 期刊的日期是期號日期，實務上都會落在「舊」。
+  journal_lookback_days: 14 # 每日抓期刊新增時往回看幾天（用 created_date，不是 publication_date）。
+  openalex_sources: # 要追蹤的期刊。留空即停用期刊來源。
+    - S111326731 # IEEE Transactions on Geoscience and Remote Sensing
+    - S126920919 # IEEE Geoscience and Remote Sensing Letters
+  openalex_mailto: ${oc.env:OPENALEX_MAILTO,""} # 填了會進 OpenAlex 的 polite pool，速率上限較寬鬆。
+
 executor:
   debug: false
+  dry_run: false # 只印出選中的論文，不寄信、也不計入推薦次數。
   send_empty: false # 當天沒有新論文時是否仍寄空信。
-  max_paper_num: 100 # 郵件中呈現的論文數量上限。
   source: ['arxiv'] # 要檢索的來源。範例: ['arxiv','biorxiv','medrxiv','chemrxiv']
-  reranker: local # local 用本機模型（免 API）；api 用 embedding API（免安裝 torch）。
+  reranker: local # 決定 embedding 用哪一種：local 用本機模型（免 API）；api 用 embedding API（免安裝 torch）。
