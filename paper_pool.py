@@ -21,7 +21,7 @@ SCORE_SCALE = 10
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers(
   id TEXT PRIMARY KEY,
-  norm_title TEXT NOT NULL,
+  norm_title TEXT,
   source TEXT NOT NULL,
   title TEXT NOT NULL,
   abstract TEXT NOT NULL,
@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS papers(
   last_recommended_at TEXT,
   carded INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_papers_norm_title ON papers(norm_title);
+-- UNIQUE 讓「同一篇論文只進池一次」由資料庫保證，而不是靠應用層的先查再寫。
+-- 標題無法正規化者存 NULL；SQLite 的 UNIQUE 允許多個 NULL，因此不會互撞。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_papers_norm_title ON papers(norm_title);
 CREATE INDEX IF NOT EXISTS idx_papers_pending ON papers(carded, embedding_model);
 """
 
@@ -59,6 +61,19 @@ def normalize_title(title):
     return "".join(ch for ch in folded if ch.isalnum())
 
 
+def _l2_normalize(array):
+    """把向量正規化成單位長度。
+
+    分數公式 `(向量 · 質心) * 10` 只有在雙方都是單位向量時才等於餘弦相似度。
+    OpenAI 的 embedding 恰好已正規化，但本機模型與未來的來源不保證如此，
+    因此在寫入與合成質心時強制正規化，讓這個前提由結構保證而非呼叫端自律。
+    """
+    norms = np.linalg.norm(array, axis=-1, keepdims=True)
+    if np.any(norms == 0):
+        raise ValueError("零向量無法正規化。")
+    return (array / norms).astype(EMBEDDING_DTYPE)
+
+
 def time_decay_weights(count):
     """與 reranker/base.py 相同的時間衰減權重，順序為新到舊。"""
     if count <= 0:
@@ -74,7 +89,7 @@ def weighted_centroid(vectors, weights=None):
     恆等，因為內積是線性的：sum_i w_i (c·h_i) = c·(sum_i w_i h_i)。
     用質心可少算 len(history) 倍的乘法，排序與分數都不變。
     """
-    matrix = np.asarray(vectors, dtype=EMBEDDING_DTYPE)
+    matrix = _l2_normalize(np.asarray(vectors, dtype=EMBEDDING_DTYPE))
     if matrix.ndim != 2 or matrix.shape[0] == 0:
         raise ValueError("weighted_centroid 需要形狀為 (n, dim) 且非空的向量。")
     if weights is None:
@@ -158,26 +173,17 @@ class PaperPool:
         now = _utcnow_iso()
         with self._conn:
             for record in records:
-                if self._conn.execute("SELECT 1 FROM papers WHERE id = ?", (record.id,)).fetchone():
-                    skipped_id += 1
-                    continue
-                norm_title = normalize_title(record.title)
-                if (
-                    norm_title
-                    and self._conn.execute(
-                        "SELECT 1 FROM papers WHERE norm_title = ?", (norm_title,)
-                    ).fetchone()
-                ):
-                    # 同一篇論文的 arXiv 預印本與 IEEE 正式版 id 不同、標題相同。
-                    skipped_title += 1
-                    continue
-                self._conn.execute(
+                # 先寫入再判斷結果，而不是「先查再寫」——後者在兩個程序同時
+                # ingest 時（例如回填正在跑，每日任務剛好觸發）會讓同一篇論文
+                # 兩個版本都進池。ON CONFLICT 由 PRIMARY KEY 與 norm_title 的
+                # UNIQUE 索引共同把關，是原子的。
+                cursor = self._conn.execute(
                     "INSERT INTO papers (id, norm_title, source, title, abstract, url,"
                     " pdf_url, published_date, added_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (
                         record.id,
-                        norm_title,
+                        normalize_title(record.title) or None,
                         record.source,
                         record.title,
                         record.abstract,
@@ -187,7 +193,16 @@ class PaperPool:
                         now,
                     ),
                 )
-                inserted += 1
+                if cursor.rowcount == 1:
+                    inserted += 1
+                elif self._conn.execute(
+                    "SELECT 1 FROM papers WHERE id = ?", (record.id,)
+                ).fetchone():
+                    skipped_id += 1
+                else:
+                    # id 沒撞到卻寫不進去，代表撞的是正規化標題：
+                    # 同一篇論文的 arXiv 預印本與 IEEE 正式版。
+                    skipped_title += 1
         return IngestResult(inserted, skipped_id, skipped_title)
 
     def mark_carded(self, reading_history):
@@ -213,27 +228,54 @@ class PaperPool:
         return unmatched
 
     def store_embeddings(self, items, model):
-        """寫入向量。items 為 (paper_id, vector) 的可迭代物件。"""
+        """寫入向量。items 為 (paper_id, vector) 的可迭代物件。
+
+        向量一律先正規化成單位長度，`select()` 的分數才等於餘弦相似度。
+        寫到不存在的 id 會拋錯而非靜默忽略——否則那篇會永遠留在
+        `pending_embeddings()` 裡，每次執行都重算一次，是實際的成本漏洞。
+        """
+        missing = []
         with self._conn:
             for paper_id, vector in items:
                 array = np.asarray(vector, dtype=EMBEDDING_DTYPE)
                 if array.ndim != 1 or array.size == 0:
                     raise ValueError(f"{paper_id} 的向量必須是非空的一維陣列。")
-                self._conn.execute(
+                cursor = self._conn.execute(
                     "UPDATE papers SET embedding = ?, embedding_model = ? WHERE id = ?",
-                    (array.tobytes(), model, paper_id),
+                    (_l2_normalize(array).tobytes(), model, paper_id),
                 )
+                if cursor.rowcount == 0:
+                    missing.append(paper_id)
+        if missing:
+            raise PaperPoolError(f"這些 id 不在池中，向量沒有寫入：{missing}")
 
     def mark_recommended(self, papers, when=None):
-        """把選出的論文計入推薦次數。這是輪替機制的依據。"""
+        """把選出的論文計入推薦次數。這是輪替機制的依據。
+
+        同一次呼叫中重複出現的 id 只計一次；重複計數會讓該篇被錯誤地推到
+        隊伍更後方，扭曲輪替順序。
+        """
         when = when or _utcnow_iso()
-        ids = [(when, p if isinstance(p, str) else p.id) for p in papers]
+        unique_ids = list(dict.fromkeys(p if isinstance(p, str) else p.id for p in papers))
+        if not unique_ids:
+            return
         with self._conn:
-            self._conn.executemany(
+            cursor = self._conn.executemany(
                 "UPDATE papers SET recommend_count = recommend_count + 1,"
                 " last_recommended_at = ? WHERE id = ?",
-                ids,
+                [(when, paper_id) for paper_id in unique_ids],
             )
+            if cursor.rowcount != len(unique_ids):
+                found = {
+                    row["id"]
+                    for row in self._conn.execute(
+                        "SELECT id FROM papers WHERE id IN (%s)" % ",".join("?" * len(unique_ids)),
+                        unique_ids,
+                    )
+                }
+                raise PaperPoolError(
+                    f"這些 id 不在池中，推薦次數沒有更新：{sorted(set(unique_ids) - found)}"
+                )
 
     # ---------- 讀取 ----------
 
@@ -254,8 +296,11 @@ class PaperPool:
             params.append(limit)
         return [(row["id"], row["abstract"]) for row in self._conn.execute(sql, params)]
 
-    def select(self, centroid, n_new, n_old, new_within_days, today=None):
+    def select(self, centroid, n_new, n_old, new_within_days, today=None, model=None):
         """依配額與輪替排序選出要推薦的論文。
+
+        指定 `model` 只採用該模型算出的向量。未指定時，若池中存在多個模型的
+        向量會直接拋錯——不同模型的向量不可比，混在一起評分會靜默給出錯誤排名。
 
         排序鍵是 `(recommend_count ASC, score DESC)`：推薦過的排到隊伍後方，
         等其他高分論文都輪過一遍才會再出現，因此不會連續多天重複同一篇，
@@ -263,12 +308,25 @@ class PaperPool:
         """
         if n_new < 0 or n_old < 0:
             raise ValueError("n_new 與 n_old 不得為負數。")
-        rows = self._conn.execute(
+        sql = (
             "SELECT id, title, abstract, url, pdf_url, published_date, embedding,"
-            " recommend_count FROM papers WHERE carded = 0 AND embedding IS NOT NULL"
-        ).fetchall()
+            " embedding_model, recommend_count"
+            " FROM papers WHERE carded = 0 AND embedding IS NOT NULL"
+        )
+        params = []
+        if model is not None:
+            sql += " AND embedding_model = ?"
+            params.append(model)
+        rows = self._conn.execute(sql, params).fetchall()
         if not rows:
             return []
+
+        models = {row["embedding_model"] for row in rows}
+        if len(models) > 1:
+            raise PaperPoolError(
+                f"池中混用了多個 embedding 模型 {sorted(models)}，向量不可比。"
+                " 請指定 model 參數，或重新計算整個池子的向量。"
+            )
 
         blobs = [row["embedding"] for row in rows]
         dim = len(blobs[0]) // EMBEDDING_DTYPE().itemsize

@@ -3,7 +3,9 @@
 全部離線：不連網、不呼叫任何 API，向量以固定亂數種子產生。
 """
 
+import sqlite3
 import sys
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -13,6 +15,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from paper_pool import (  # noqa: E402
+    PaperPool,
     PaperPoolError,
     PaperRecord,
     normalize_title,
@@ -31,6 +34,11 @@ def unit(seed, dim=DIM):
     rng = np.random.default_rng(seed)
     vector = rng.standard_normal(dim).astype(np.float32)
     return vector / np.linalg.norm(vector)
+
+
+def raw(seed, scale, dim=DIM):
+    """未正規化的向量：長度不是 1。"""
+    return unit(seed, dim) * scale
 
 
 def record(paper_id, title="Some Paper", published="2020-01-01", source="arxiv", abstract="a"):
@@ -314,6 +322,120 @@ class ScoreEquivalenceTests(PoolTestCase):
             weighted_centroid(np.zeros((0, DIM), dtype=np.float32))
         with self.assertRaises(ValueError):
             weighted_centroid(np.zeros((3, DIM), dtype=np.float32), weights=np.ones(2))
+
+
+# Codex 審查後補：向量正規化（不變式 13 的前提）
+class NormalizationTests(PoolTestCase):
+    def test_unnormalized_vectors_are_normalized_on_write(self):
+        # [2,0,...]·[2,0,...]*10 = 40，但餘弦分數應為 10。
+        self.pool.ingest([record("a", "A", "2022-01-01")])
+        self.pool.store_embeddings([("a", raw(1, 2.0))], "m1")
+        centroid = weighted_centroid(np.stack([raw(1, 3.0)]))
+        picked = self.pool.select(centroid, 0, 1, 7, today=date(2026, 9, 6))
+        self.assertAlmostEqual(picked[0].score, 10.0, places=4)
+
+    def test_scale_does_not_change_ranking_or_score(self):
+        self.pool.ingest([record(i, i.upper(), "2022-01-01") for i in ("a", "b")])
+        self.pool.store_embeddings([("a", unit(1)), ("b", raw(2, 7.0))], "m1")
+        history = np.stack([unit(11), unit(12)])
+        scaled = self.pool.select(weighted_centroid(history * 5), 0, 2, 7, today=date(2026, 9, 6))
+        plain = self.pool.select(weighted_centroid(history), 0, 2, 7, today=date(2026, 9, 6))
+        self.assertEqual([p.id for p in scaled], [p.id for p in plain])
+        for a, b in zip(scaled, plain):
+            self.assertAlmostEqual(a.score, b.score, places=4)
+
+    def test_zero_vector_is_rejected(self):
+        self.pool.ingest([record("a", "A")])
+        with self.assertRaises(ValueError):
+            self.pool.store_embeddings([("a", np.zeros(DIM, dtype=np.float32))], "m1")
+
+
+# Codex 審查後補：去重由資料庫保證，而非應用層的先查再寫
+class AtomicDedupTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = str(Path(self.tmp.name) / "pool.sqlite")
+
+    def open(self):
+        pool = PaperPool(sqlite3.connect(self.path))
+        self.addCleanup(pool.close)
+        return pool
+
+    def test_separate_connections_cannot_both_insert_the_same_title(self):
+        # 回填跑到一半時每日任務觸發，兩個連線同時寫入同一篇論文。
+        first, second = self.open(), self.open()
+        first.ingest([record("arxiv:1", EDGEPHASE_ARXIV)])
+        result = second.ingest([record("doi:10.1109/x", EDGEPHASE_CARD, source="openalex")])
+        self.assertEqual(result.inserted, 0)
+        self.assertEqual(result.skipped_title, 1)
+        self.assertEqual(first.stats()["total"], 1)
+
+    def test_unique_index_exists_on_norm_title(self):
+        pool = self.open()
+        indexes = {
+            row["name"]: row["unique"] for row in pool._conn.execute("PRAGMA index_list('papers')")
+        }
+        self.assertEqual(indexes.get("idx_papers_norm_title"), 1)
+
+    def test_untitled_papers_do_not_collide(self):
+        # 標題無法正規化者存 NULL；UNIQUE 允許多個 NULL。
+        pool = self.open()
+        result = pool.ingest([record("a", ""), record("b", "   ")])
+        self.assertEqual(result.inserted, 2)
+
+
+# Codex 審查後補：交易邊界
+class TransactionTests(PoolTestCase):
+    def test_failure_mid_batch_rolls_back_the_whole_ingest(self):
+        def records_then_fail():
+            yield record("a", "A")
+            raise RuntimeError("模擬來源中途失敗")
+
+        with self.assertRaises(RuntimeError):
+            self.pool.ingest(records_then_fail())
+        self.assertEqual(self.pool.stats()["total"], 0)
+
+
+# Codex 審查後補：寫入不存在的 id 要出聲
+class UnknownIdTests(PoolTestCase):
+    def test_storing_embedding_for_unknown_id_raises(self):
+        # 靜默忽略會讓那篇永遠 pending，每次執行都重算一次向量。
+        with self.assertRaises(PaperPoolError):
+            self.pool.store_embeddings([("nope", unit(1))], "m1")
+
+    def test_marking_unknown_id_as_recommended_raises(self):
+        with self.assertRaises(PaperPoolError):
+            self.pool.mark_recommended(["nope"])
+
+    def test_duplicate_ids_in_one_call_count_once(self):
+        self.fill([("a", "A", "2022-01-01", 1)])
+        self.pool.mark_recommended(["a", "a", "a"])
+        count = self.pool._conn.execute(
+            "SELECT recommend_count FROM papers WHERE id = 'a'"
+        ).fetchone()["recommend_count"]
+        self.assertEqual(count, 1)
+
+    def test_empty_recommendation_list_is_a_noop(self):
+        self.pool.mark_recommended([])
+
+
+# Codex 審查後補：不同模型的向量不可比
+class EmbeddingModelTests(PoolTestCase):
+    def setUp(self):
+        super().setUp()
+        self.today = date(2026, 9, 6)
+        self.pool.ingest([record(i, i.upper(), "2022-01-01") for i in ("a", "b")])
+        self.pool.store_embeddings([("a", unit(1))], "m1")
+        self.pool.store_embeddings([("b", unit(2))], "m2")
+
+    def test_mixed_models_are_rejected(self):
+        with self.assertRaises(PaperPoolError):
+            self.pool.select(unit(100), 0, 2, 7, today=self.today)
+
+    def test_model_filter_selects_only_matching_vectors(self):
+        picked = self.pool.select(unit(100), 0, 2, 7, today=self.today, model="m1")
+        self.assertEqual([p.id for p in picked], ["a"])
 
 
 class StatsTests(PoolTestCase):
