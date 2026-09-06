@@ -23,7 +23,7 @@ for path in (ROOT, ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from embeddings import ApiEmbedder, embed_pending  # noqa: E402
+from embeddings import DEFAULT_TPM, ApiEmbedder, embed_pending  # noqa: E402
 from openalex import GRSL, TGRS, OpenAlexClient, year_start  # noqa: E402
 from paper_pool import PaperRecord, open_pool  # noqa: E402
 
@@ -135,7 +135,7 @@ def backfill_journals(pool, client, sources, start, end=None):
     return inserted, skipped
 
 
-def embed(pool, model, base_url, api_key, batch_size):
+def embed(pool, model, base_url, api_key, batch_size, tokens_per_minute=DEFAULT_TPM):
     """把池中缺向量的論文補齊。這一步會呼叫付費 API。"""
     from openai import OpenAI
 
@@ -145,7 +145,7 @@ def embed(pool, model, base_url, api_key, batch_size):
             "或改用 --embed-key 傳入。"
         )
     client = OpenAI(api_key=api_key, base_url=base_url or None)
-    done = embed_pending(pool, ApiEmbedder(client, model, batch_size))
+    done = embed_pending(pool, ApiEmbedder(client, model, batch_size, tokens_per_minute))
     print(f"  計算了 {done} 篇的向量")
 
 
@@ -154,7 +154,14 @@ def run(args):
     try:
         if args.embed_only:
             print(f"計算向量（模型 {args.embed_model}）…")
-            embed(pool, args.embed_model, args.embed_base_url, args.embed_key, args.batch_size)
+            embed(
+                pool,
+                args.embed_model,
+                args.embed_base_url,
+                args.embed_key,
+                args.batch_size,
+                args.tpm,
+            )
             print(f"\n池中共 {pool.stats()['total']} 篇，全部已有向量。")
             return 0
 
@@ -177,7 +184,14 @@ def run(args):
 
         if args.embed:
             print(f"計算向量（模型 {args.embed_model}）…")
-            embed(pool, args.embed_model, args.embed_base_url, args.embed_key, args.batch_size)
+            embed(
+                pool,
+                args.embed_model,
+                args.embed_base_url,
+                args.embed_key,
+                args.batch_size,
+                args.tpm,
+            )
 
         stats = pool.stats()
         print(
@@ -210,6 +224,12 @@ def main(argv=None):
     parser.add_argument("--embed-key", default=None, help="API 金鑰，預設讀 .env")
     parser.add_argument("--embed-base-url", default=None, help="API 位址，預設讀 .env")
     parser.add_argument("--batch-size", type=int, default=64, help="每批送出的摘要數")
+    parser.add_argument(
+        "--tpm",
+        type=int,
+        default=DEFAULT_TPM,
+        help=f"embedding API 的每分鐘 token 上限，預設 {DEFAULT_TPM:,}。超過會被 429 擋下。",
+    )
     args = parser.parse_args(argv)
 
     if args.embed or args.embed_only:

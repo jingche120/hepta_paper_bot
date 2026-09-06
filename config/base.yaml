@@ -44,6 +44,8 @@ reranker:
     base_url: ${oc.env:EMBEDDING_BASE_URL,null}
     model: ${oc.env:EMBEDDING_MODEL,null}
     batch_size: null # 依供應商上限調整。範例: 64
+    tokens_per_minute: null # 每分鐘 token 上限（TPM）。留空用 1,000,000。
+    # embedding API 限制的是 token 數而非請求數；回填時不節流會在幾十秒內撞上 429。
 
 pool:
   db_path: data/paper_pool.sqlite # 候選池。相對路徑以專案根目錄為基準。
