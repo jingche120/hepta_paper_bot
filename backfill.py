@@ -24,7 +24,7 @@ for path in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(path))
 
 from embeddings import ApiEmbedder, embed_pending  # noqa: E402
-from openalex import GRSL, TGRS, OpenAlexClient  # noqa: E402
+from openalex import GRSL, TGRS, OpenAlexClient, year_start  # noqa: E402
 from paper_pool import PaperRecord, open_pool  # noqa: E402
 
 DEFAULT_DB = "data/paper_pool.sqlite"
@@ -114,11 +114,20 @@ def backfill_arxiv(pool, categories, start, end, config_overrides=None):
 
 
 def backfill_journals(pool, client, sources, start, end=None):
-    """逐本期刊回填，同樣讓每本各自成為一個交易。"""
+    """逐本期刊回填，同樣讓每本各自成為一個交易。
+
+    起始日一律對齊年初：期號日期的粒度是「年」，`--since 2026-07-01` 直接送出去
+    會讓 2026 年整年（標成 2026-01-01）落在區間外，回傳 0 筆而且不報錯。
+    """
     inserted = skipped = 0
+    journal_start = year_start(start)
+    if journal_start != start:
+        print(f"  期刊起始日對齊年初：{start} → {journal_start}（期號日期的粒度是年）")
     for source_id, name in sources.items():
         result = pool.ingest(
-            client.fetch_works(source_id, start.isoformat(), end.isoformat() if end else None)
+            client.fetch_works(
+                source_id, journal_start.isoformat(), end.isoformat() if end else None
+            )
         )
         print(f"  {name}：寫入 {result.inserted}，跳過 {result.skipped}（無摘要者已略過）")
         inserted += result.inserted

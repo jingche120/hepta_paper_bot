@@ -88,18 +88,24 @@ def work_to_record(work):
     )
 
 
+def year_start(day):
+    """把日期對齊到所在年份的 1 月 1 日。
+
+    期號日期的粒度是「年」（2026 年的論文全部標成 2026-01-01），所以任何年中的
+    起始日都會把整年排除：`from_publication_date:2026-07-01` 對 2026 年的論文
+    回傳 0 筆，而且不報錯。查詢期刊的起始日一律要先過這個函式。
+    """
+    return date(day.year, 1, 1)
+
+
 def publication_window_start(today, lookback_days):
-    """每日增量要從哪一天開始抓期刊。
+    """每日增量要從哪一天開始抓期刊：`today - lookback_days` 所在年份的年初。
 
-    回傳 `today - lookback_days` 所在**年份的 1 月 1 日**。
-
-    期號日期的粒度是「年」（2026 年的論文全部標成 2026-01-01），所以用天數往回推
-    會直接把整年排除——`from_publication_date:2026-08-07` 對 2026 年的論文回傳 0 筆。
-    對齊到年初才抓得到，而跨年那幾天會自然同時涵蓋前一年，不會有空窗。
+    跨年那幾天會自然同時涵蓋前一年，不會有空窗。
     """
     if lookback_days < 0:
         raise ValueError("lookback_days 不得為負數。")
-    return date((today - timedelta(days=lookback_days)).year, 1, 1).isoformat()
+    return year_start(today - timedelta(days=lookback_days)).isoformat()
 
 
 class OpenAlexClient:

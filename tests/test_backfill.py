@@ -199,6 +199,13 @@ class JournalRangeTests(unittest.TestCase):
             )
         self.assertEqual(self.calls, [("S1", "2022-01-01", "2022-12-31")])
 
+    def test_a_mid_year_since_is_snapped_to_the_start_of_the_year(self):
+        # --since 2026-07-01 直接送出去，2026 年整年（標成 2026-01-01）會落在
+        # 區間外，回傳 0 筆而且不報錯。
+        with open_pool(":memory:") as pool:
+            backfill_journals(pool, self.client, {"S1": "TGRS"}, date(2026, 7, 1))
+        self.assertEqual(self.calls, [("S1", "2026-01-01", None)])
+
     def test_no_until_means_no_upper_bound(self):
         # 用今天當上限會漏掉期號日期在未來的論文。
         with open_pool(":memory:") as pool:

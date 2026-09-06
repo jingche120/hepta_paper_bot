@@ -13,6 +13,7 @@ from openalex import (  # noqa: E402
     abstract_from_inverted_index,
     publication_window_start,
     work_to_record,
+    year_start,
 )
 
 
@@ -180,6 +181,10 @@ class PublicationWindowTests(unittest.TestCase):
 
     def test_a_zero_lookback_stays_in_the_current_year(self):
         self.assertEqual(publication_window_start(date(2026, 9, 6), 0), "2026-01-01")
+
+    def test_year_start_snaps_any_day_to_january_first(self):
+        self.assertEqual(year_start(date(2026, 7, 1)), date(2026, 1, 1))
+        self.assertEqual(year_start(date(2026, 1, 1)), date(2026, 1, 1))
 
     def test_a_negative_lookback_is_rejected(self):
         with self.assertRaises(ValueError):
