@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from uuid import uuid4
 
 import httpx
 from mcp.client.auth import OAuthClientProvider
@@ -14,6 +15,16 @@ from mcp.shared.auth import (
 from pydantic import BaseModel, ConfigDict, Field
 
 SERVICE = "daily-paper-bot.heptabase.oauth"
+
+# Windows 認證管理員每筆的上限是 CRED_MAX_CREDENTIAL_BLOB_SIZE（2560 bytes），而 keyring
+# 以 UTF-16 編碼寫入，實際只放得下 1280 個字元。授權資料含兩份 OAuth 探索資訊，實測約
+# 3000~4000 字元，整筆寫入會得到 WinError 1783，且錯誤發生在瀏覽器授權**之後**——權杖
+# 已經拿到卻存不下來，每次重試都白費一輪授權。因此一律分段。macOS 鑰匙圈沒有這個上限，
+# 但兩邊共用同一段程式碼，分段對它無害。
+CHUNK_CHARS = 1024
+# 索引值的前綴。一般酬載是 JSON、必定以 `{` 開頭，不會與這個前綴相撞，所以分段之前
+# 以單筆格式存進去的資料仍然讀得回來。
+INDEX_PREFIX = "v1:"
 
 
 class KeychainStorageError(RuntimeError):
@@ -56,25 +67,84 @@ class KeychainStorage:
         self.saved = None
         self.context = None
 
+    def _key(self, name):
+        return f"{self.server_url}:{name}"
+
+    def _chunk_key(self, name, generation, position):
+        return f"{self.server_url}:{name}#{generation}#{position}"
+
     async def _read(self, name, model):
         try:
-            raw = await asyncio.to_thread(
-                self.backend.get_password, SERVICE, f"{self.server_url}:{name}"
-            )
-            return None if raw is None else model.model_validate_json(raw)
+            raw = await asyncio.to_thread(self.backend.get_password, SERVICE, self._key(name))
+            if raw is None:
+                return None
+            if raw.startswith(INDEX_PREFIX):
+                raw = await self._join(name, raw)
+                if raw is None:
+                    # 世代不完整，只可能來自被中斷的寫入。當成沒有授權、重跑一次流程，
+                    # 比拋錯好：使用者重新授權即可，不必自己去清認證管理員。
+                    return None
+            return model.model_validate_json(raw)
         except Exception:
             raise KeychainStorageError("鑰匙圈讀取失敗或資料格式不正確。") from None
 
+    async def _join(self, name, index):
+        """把索引指到的那個世代接回完整酬載；缺任何一段就視為不完整。"""
+        _, generation, count = index.split(":", 2)
+        parts = []
+        for position in range(int(count)):
+            part = await asyncio.to_thread(
+                self.backend.get_password, SERVICE, self._chunk_key(name, generation, position)
+            )
+            if part is None:
+                return None
+            parts.append(part)
+        return "".join(parts)
+
     async def _write(self, name, value):
+        payload = value.model_dump_json()
+        chunks = [payload[at : at + CHUNK_CHARS] for at in range(0, len(payload), CHUNK_CHARS)] or [
+            ""
+        ]
+        generation = uuid4().hex[:8]
         try:
+            previous = await asyncio.to_thread(self.backend.get_password, SERVICE, self._key(name))
+        except Exception:
+            previous = None  # 讀不到舊索引只是無法清理，不該擋下這次寫入。
+        try:
+            for position, chunk in enumerate(chunks):
+                await asyncio.to_thread(
+                    self.backend.set_password,
+                    SERVICE,
+                    self._chunk_key(name, generation, position),
+                    chunk,
+                )
+            # 索引是單筆小寫入，也是整次更新的原子切換點：寫成功之前讀到的仍是舊世代，
+            # 寫成功之後才整份換新。中途失敗不會讓讀取端看到半套資料。
             await asyncio.to_thread(
                 self.backend.set_password,
                 SERVICE,
-                f"{self.server_url}:{name}",
-                value.model_dump_json(),
+                self._key(name),
+                f"{INDEX_PREFIX}{generation}:{len(chunks)}",
             )
         except Exception:
             raise KeychainStorageError("鑰匙圈寫入失敗；授權資料未可靠保存。") from None
+        await self._discard(name, previous)
+
+    async def _discard(self, name, index):
+        """切換完成後清掉舊世代。清不掉只會留下孤兒項目，不影響正確性。"""
+        if not index or not index.startswith(INDEX_PREFIX):
+            return
+        try:
+            _, generation, count = index.split(":", 2)
+            for position in range(int(count)):
+                await asyncio.to_thread(
+                    self.backend.delete_password,
+                    SERVICE,
+                    self._chunk_key(name, generation, position),
+                )
+        except Exception:
+            pass
 
     async def get_tokens(self):
         self.saved = await self._read("tokens", SavedAuthorization)

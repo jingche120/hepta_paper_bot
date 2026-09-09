@@ -174,6 +174,8 @@ WHITEBOARD_ID = "00000000-0000-4000-8000-000000000000"
 
 來源論文：Real-time Seismic Intensity Prediction using Self-supervised Contrastive GNN
 
+完整標題：Real-time Seismic Intensity Prediction using Self-supervised Contrastive GNN
+
 ## English Abstract
 
 This paper studies regional earthquake early warning as a direct regression problem...
@@ -192,7 +194,7 @@ Earthquake Early Warning、Seismic Intensity Prediction、SC-GNN。
 
 | 卡片內容 | 對應閱讀紀錄欄位 | 作用 |
 |---|---|---|
-| `來源論文：` 那一行 | `title` | **不參與計分**，只用於顯示與日誌 |
+| `完整標題：` 那一行（沒有則 `來源論文：`） | `title` | **不參與計分**，只用於顯示與日誌 |
 | `## English Abstract` + `## 中文摘要` | `abstract` | **唯一決定推薦品質的欄位** |
 | `## 關鍵字` | `paths` | 供 `include_path` / `ignore_path` 做 glob 篩選 |
 | 卡片建立時間（來自 `list_cards`） | `added_date` | 時間衰減權重，越新的卡片權重越高 |
@@ -205,8 +207,12 @@ Earthquake Early Warning、Seismic Intensity Prediction、SC-GNN。
   中文摘要則補上你關注的角度。兩節都寫效果最好，只寫一節也能運作。
 - **章節名稱有彈性**：英文摘要接受 `English Abstract`／`Abstract`／`英文摘要`；
   中文摘要接受 `中文摘要`／`摘要`；關鍵字接受 `關鍵字`／`關鍵詞`／`Keywords`。
-- **標題來源**：優先取 `來源論文：`（真正的論文名），其次卡片的一級標題，
-  最後才用 `list_cards` 回報的卡片標題。`<hepta-mention>` 標籤會被移除，內文保留。
+- **標題來源**：依序取 `完整標題：`、`來源論文：`、卡片的一級標題，最後才用
+  `list_cards` 回報的卡片標題。`完整標題：` 是你手寫的論文全名，最可信，所以排最前面
+  —— 有了它，一級標題就能自由寫成短代號（`# 論文總覽：PatchTST`）。
+  `來源論文：` 指向的 PDF 卡片有時以 arXiv 查詢字串命名，那不是標題，會被自動跳過；
+  `完整標題：` 同樣受這道檢查保護。兩者的前後 `*`／`_` 強調符號會去掉，
+  `<hepta-mention>` 標籤會被移除、內文保留。
 - **關鍵字分隔符**：頓號、逗號、分號都可以，結尾句號會自動去掉。
 - **找不到摘要章節時**，會退回使用整張卡片內文，並在匯出結束時列出這些卡片提醒你補寫 ——
   不會靜默漏掉整篇論文。

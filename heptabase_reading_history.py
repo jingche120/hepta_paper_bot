@@ -2,8 +2,9 @@
 
 白板上每張卡片是一篇讀過的論文總覽，內容依 Markdown 章節組織：
 
-    # 論文總覽：<自訂標題>
-    來源論文：<hepta-mention ...>真正的論文標題</hepta-mention>
+    # 論文總覽：<自訂短代號>
+    來源論文：<hepta-mention ...>指向的 PDF 卡片名稱</hepta-mention>
+    完整標題：<論文全名>
     ## English Abstract
     ...
     ## 中文摘要
@@ -32,6 +33,9 @@ HEADING = re.compile(r"^(#{1,6})\s+(?P<name>.*?)\s*$")
 SOURCE_PAPER = re.compile(
     r"^(?:來源論文|原始論文|論文出處|source paper)\s*[:：]\s*(?P<title>.+)$", re.I
 )
+# 卡片裡人工寫下的論文全名。有了這一行，一級標題就能自由寫成短代號
+# （`# 論文總覽：PatchTST`），不必為了讓解析器抓對而塞進論文全名。
+FULL_TITLE = re.compile(r"^(?:完整標題|完整題目|full title)\s*[:：]\s*(?P<title>.+)$", re.I)
 # 章節名稱正規化後的對應；同一種內容可能有多個寫法。
 ENGLISH_ABSTRACT_SECTIONS = frozenset({"english abstract", "abstract", "英文摘要"})
 CHINESE_ABSTRACT_SECTIONS = frozenset({"中文摘要", "摘要", "chinese abstract"})
@@ -124,25 +128,44 @@ def _first_section(sections, names):
     return ""
 
 
-def _extract_title(cleaned, fallback_title):
-    """優先取「來源論文：」的真實論文標題，其次卡片的一級標題，最後 list_cards 的標題。
+def _strip_emphasis(text):
+    """去掉整段包住標題的 Markdown 強調符號；標題內部的星號不受影響。"""
+    return text.strip().strip("*_").strip()
 
-    `來源論文：` 通常寫在一級標題底下，會被歸進該章節的內文而非前言，
+
+def _title_candidate(pattern, line):
+    """取出欄位值當標題；值不像標題時回傳空字串，交給呼叫端往下退。"""
+    match = pattern.match(line)
+    if match is None:
+        return ""
+    candidate = _strip_emphasis(match.group("title"))
+    # PDF 卡片若以網址或 arXiv 查詢字串命名，這裡拿到的不是論文標題。
+    # `完整標題：` 也一樣要擋：那行貼成網址時，寧可往下退，也不要拿網址當標題。
+    return "" if NOT_A_TITLE.search(candidate) else candidate
+
+
+def _extract_title(cleaned, fallback_title):
+    """依序取「完整標題：」、「來源論文：」、卡片一級標題，最後才用 list_cards 的標題。
+
+    `完整標題：` 是卡片裡人工寫下的論文全名，最可信，所以排在最前面。
+    這些欄位通常寫在一級標題底下，會被歸進該章節的內文而非前言，
     因此這裡掃描整份文字而不是只看前言。
+
+    一級標題刻意不做 `_strip_emphasis`：它的強調符號在 `論文總覽：` 之後
+    （`# 論文總覽：*A...*`），只去頭尾會變成不對稱的 `論文總覽：*A...`，比不動更糟。
     """
-    first_heading = ""
+    full_title = ""
     source_title = ""
+    first_heading = ""
     for line in cleaned.splitlines():
         stripped = line.strip()
-        match = SOURCE_PAPER.match(stripped)
-        if match and not source_title:
-            candidate = match.group("title").strip()
-            # PDF 卡片若以網址或 arXiv 查詢字串命名，這裡拿到的不是論文標題。
-            if candidate and not NOT_A_TITLE.search(candidate):
-                source_title = candidate
+        if not full_title:
+            full_title = _title_candidate(FULL_TITLE, stripped)
+        if not source_title:
+            source_title = _title_candidate(SOURCE_PAPER, stripped)
         if not first_heading and stripped.startswith("# "):
             first_heading = stripped[2:].strip()
-    return source_title or first_heading or fallback_title
+    return full_title or source_title or first_heading or fallback_title
 
 
 def _extract_keywords(sections):
