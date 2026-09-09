@@ -1,5 +1,6 @@
-.env
-.env.*
+# 用 .env* 而非 .env.*：搬移或備份時常見的 .env_copy、.env2 不含點，
+# 原本的規則擋不住，會變成 untracked 檔案而被 git add -A 一併收進去。
+.env*
 !.env.example
 .venv/
 __pycache__/
