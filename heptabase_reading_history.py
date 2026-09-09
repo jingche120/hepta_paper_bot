@@ -17,6 +17,7 @@
 import html
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -219,9 +220,10 @@ def load_reading_history(path):
         payload = json.loads(path.read_text(encoding="utf-8"))
         papers = payload["papers"]
     except FileNotFoundError:
+        # 用 sys.executable 而非寫死 .venv/bin/python：Windows 的 venv 版面不同。
         raise ReadingHistoryError(
             f"找不到閱讀紀錄 {path}。請先執行："
-            f"\n    .venv/bin/python get_hepthabase_bot.py --export {path}"
+            f"\n    {sys.executable} get_hepthabase_bot.py --export {path}"
         ) from None
     except (ValueError, KeyError, TypeError):
         raise ReadingHistoryError(f"閱讀紀錄 {path} 格式不正確，請重新匯出。") from None

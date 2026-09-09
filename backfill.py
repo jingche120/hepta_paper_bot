@@ -23,6 +23,9 @@ for path in (ROOT, ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+# DEFAULT_DB 等相對路徑以工作目錄為基準；釘住工作目錄，避免在別處執行時另建一個空池。
+os.chdir(ROOT)
+
 from embeddings import DEFAULT_TPM, ApiEmbedder, embed_pending  # noqa: E402
 from openalex import GRSL, TGRS, OpenAlexClient, year_start  # noqa: E402
 from paper_pool import PaperRecord, open_pool  # noqa: E402
@@ -199,7 +202,8 @@ def run(args):
             f"待計算向量 {stats['pending_embedding']} 篇"
         )
         if stats["pending_embedding"]:
-            print("計算向量請執行：.venv/bin/python backfill.py --embed-only")
+            # 用 sys.executable 而非寫死 .venv/bin/python：Windows 的 venv 版面不同。
+            print(f"計算向量請執行：{sys.executable} backfill.py --embed-only")
     finally:
         pool.close()
     return 0

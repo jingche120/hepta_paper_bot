@@ -1,4 +1,4 @@
-"""OAuth 輔助元件：不讀取 .env，授權存入 macOS 鑰匙圈。"""
+"""OAuth 輔助元件：不讀取 .env，授權存入作業系統的憑證儲存。"""
 
 import asyncio
 import secrets

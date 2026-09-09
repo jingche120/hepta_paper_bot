@@ -13,6 +13,11 @@ for path in (ROOT, ROOT / "src"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
+# 設定裡的相對路徑（pool.db_path、hydra.run.dir）以工作目錄為基準。排程器用自己的
+# 預設工作目錄啟動時，候選池會指到別處並默默建一個空的，不會報錯。釘住工作目錄，
+# 讓從哪裡執行都讀寫同一份資料。
+os.chdir(ROOT)
+
 # macOS 的 python.org 版 Python 預設沒有 CA 憑證，urllib（feedparser 用）會以
 # CERTIFICATE_VERIFY_FAILED 失敗。指向 certifi 的憑證庫，讓排程執行也不必手動處理。
 if "SSL_CERT_FILE" not in os.environ:

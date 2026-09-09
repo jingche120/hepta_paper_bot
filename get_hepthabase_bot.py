@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+import sys
 from pathlib import Path
 
 import httpx
@@ -106,9 +107,8 @@ def report_error(error):
     elif isinstance(error, ReadingHistoryError):
         print(f"卡片解析失敗：{error}")
     elif isinstance(error, KeychainStorageError):
-        print(
-            "鑰匙圈存取失敗。請確認 macOS 鑰匙圈已解鎖、允許此 Python 存取，且已安裝 requirements.txt。"
-        )
+        store = "Windows 認證管理員" if sys.platform == "win32" else "macOS 鑰匙圈"
+        print(f"憑證存取失敗。請確認{store}可用、允許此 Python 存取，且已安裝 requirements.txt。")
     elif isinstance(error, httpx.HTTPStatusError):
         print(f"HTTP 請求失敗：{error.response.status_code}。")
     elif isinstance(error, (TimeoutError, httpx.TimeoutException)):

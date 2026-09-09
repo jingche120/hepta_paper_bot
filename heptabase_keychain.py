@@ -1,4 +1,4 @@
-"""macOS 鑰匙圈儲存；不使用 .env、一般檔案或自動選擇的後端。"""
+"""作業系統憑證儲存；不使用 .env、一般檔案或自動選擇的後端。"""
 
 import asyncio
 import sys
@@ -31,18 +31,27 @@ class SavedAuthorization(BaseModel):
     auth_server_url: str | None = None
 
 
+def _load_backend():
+    """依平台指名後端。不呼叫 keyring 的自動選擇，因為它可能落到明文後端。"""
+    try:
+        if sys.platform == "darwin":
+            from keyring.backends.macOS import Keyring
+
+            return Keyring()
+        if sys.platform == "win32":
+            from keyring.backends.Windows import WinVaultKeyring
+
+            return WinVaultKeyring()
+    except Exception:
+        raise KeychainStorageError("無法載入系統憑證後端。") from None
+    raise KeychainStorageError("此儲存方式需要 macOS 鑰匙圈或 Windows 認證管理員。")
+
+
 class KeychainStorage:
     """每個 MCP URL 各自儲存用戶端與權杖；拒絕明文降級。"""
 
     def __init__(self, server_url):
-        if sys.platform != "darwin":
-            raise KeychainStorageError("此儲存方式需要 macOS 鑰匙圈。")
-        try:
-            from keyring.backends.macOS import Keyring
-
-            self.backend = Keyring()
-        except Exception:
-            raise KeychainStorageError("無法載入 macOS 鑰匙圈後端。") from None
+        self.backend = _load_backend()
         self.server_url = server_url
         self.saved = None
         self.context = None
