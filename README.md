@@ -66,7 +66,7 @@ Windows 用 `py -3.12 -m venv .venv` 建立環境（`.venv/` 不可跨平台複�
 5. `streamable_http_client(...)`：建立 MCP 的 HTTP 傳輸通道，得到接收端 `read` 與傳送端 `write`；`_` 表示此處不使用的第三個回傳值。
 6. `ClientSession(read, write)`：在傳輸通道上建立 MCP 工作階段。
 7. `await session.initialize()`：送出 MCP 初始化請求並等待結果。需要授權時，HTTP 層會啟動 OAuth、開啟瀏覽器、取得權杖，再繼續請求。
-8. `list_whiteboard_cards(session, WHITEBOARD_ID)`：列出白板上的卡片。不加 `--export` 時只印出標題清單；加了就進入 `export_whiteboard()`，逐張 `read_card()` 並解析成閱讀紀錄。離開 `async with` 區塊時，自動關閉連線。
+8. `list_whiteboard_cards(session, whiteboard_id)`：列出白板上的卡片。不加 `--export` 時只印出標題清單；加了就進入 `export_whiteboard()`，逐張 `read_card()` 並解析成閱讀紀錄。離開 `async with` 區塊時，自動關閉連線。
 
 `async def` 宣告可以等待的非同步函式；`await` 表示等候結果，同時讓其他非同步工作繼續，例如接收瀏覽器回呼。
 `async with` 負責資源的建立與清理，即使中途發生錯誤也會執行清理。
@@ -127,14 +127,18 @@ URL 的 `:tokens` 與 `:client` 兩個項目；下次執行會重新授權。這
 它允許使用 refresh token 自動更新；macOS 鑰匙圈的系統權限提示與 OAuth 是不同機制。
 此測試確認當次執行不需 OAuth，並不保證授權永不失效。
 
-### 固定讀取的白板
+### 設定要讀取的白板
 
-白板 ID 固定在 `get_hepthabase_bot.py` 的 `WHITEBOARD_ID`：
+白板 ID 屬於個人資料，不寫在原始碼，而是放在不進版控的 `config/custom.yaml`：
 
-```python
-# 白板「讀過的論文總覽們」，每張卡片是一篇讀過的論文總覽。
-WHITEBOARD_ID = "00000000-0000-4000-8000-000000000000"
+```yaml
+heptabase:
+  # 白板網址 https://app.heptabase.com/.../whiteboard/<白板 ID> 的最後一段。
+  whiteboard_id: <白板 ID>
 ```
+
+也可以臨時用 `--whiteboard <白板 ID>` 覆寫。沒設定時程式會直接提示並結束，不會猜一個預設值。
+換電腦時記得一併補上這個設定（`scripts/check_setup.py` 會檢查）。
 
 直接執行程式或按編輯器的執行按鈕，會列出白板上的卡片標題與建立時間，作為連線檢查；
 **不會輸出卡片內文**。加上 `--export` 才會逐張讀取、解析並存檔（見下一節）。

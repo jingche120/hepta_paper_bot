@@ -2,7 +2,7 @@
 
 ## Project Status
 
-A daily paper recommendation bot. The reading history (this project's term for the interest corpus) comes from the Heptabase whiteboard 「讀過的論文總覽們」, where each card is one paper overview; the bot retrieves new papers from arXiv and similar sources, ranks them by embedding similarity against that reading history, and emails the list. Git resolves to a parent repository; scope changes to this project directory and avoid staging sibling projects.
+A daily paper recommendation bot. The reading history (this project's term for the interest corpus) comes from the Heptabase whiteboard 「讀過的論文總覽們」, where each card is one paper overview; the bot retrieves new papers from arXiv and similar sources, ranks them by embedding similarity against that reading history, and emails the list.
 
 ## Project Structure & Module Organization
 

@@ -1,10 +1,17 @@
+import tempfile
 import unittest
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from get_hepthabase_bot import WHITEBOARD_ID, connect, report_error
+from get_hepthabase_bot import (
+    WhiteboardConfigError,
+    connect,
+    load_whiteboard_id,
+    report_error,
+)
 from heptabase_oauth import AuthorizationRequiredError, BrowserCallback
 
 
@@ -55,15 +62,58 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
             ) as listed,
             patch("builtins.print") as output,
         ):
-            await connect()
+            await connect("board-under-test")
         session.initialize.assert_awaited_once()
         session.list_tools.assert_not_called()
         session.call_tool.assert_not_called()
         # 不加 --export 時只列出標題，不讀取也不輸出卡片內文。
-        listed.assert_awaited_once_with(session, WHITEBOARD_ID)
+        listed.assert_awaited_once_with(session, "board-under-test")
         printed = [call.args[0] for call in output.call_args_list]
         self.assertEqual(printed[0], "Heptabase MCP 連線成功。")
         self.assertTrue(any("某篇論文" in line for line in printed))
+
+
+class WhiteboardConfigTests(unittest.TestCase):
+    """白板 ID 不寫在原始碼裡，改由不進版控的 config/custom.yaml 提供。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.config_dir = Path(self.dir.name)
+        (self.config_dir / "base.yaml").write_text(
+            "heptabase:\n  whiteboard_id: null\n", encoding="utf-8"
+        )
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def write_custom(self, text):
+        (self.config_dir / "custom.yaml").write_text(text, encoding="utf-8")
+
+    def test_reads_whiteboard_from_custom_config(self):
+        self.write_custom("heptabase:\n  whiteboard_id: ' board-from-config '\n")
+        self.assertEqual(load_whiteboard_id(config_dir=self.config_dir), "board-from-config")
+
+    def test_command_line_overrides_config(self):
+        self.write_custom("heptabase:\n  whiteboard_id: board-from-config\n")
+        self.assertEqual(
+            load_whiteboard_id("board-from-cli", config_dir=self.config_dir), "board-from-cli"
+        )
+
+    def test_missing_custom_config_is_an_error_not_a_silent_default(self):
+        with self.assertRaises(WhiteboardConfigError):
+            load_whiteboard_id(config_dir=self.config_dir)
+
+    def test_blank_whiteboard_is_an_error(self):
+        self.write_custom("heptabase:\n  whiteboard_id: '  '\n")
+        with self.assertRaises(WhiteboardConfigError):
+            load_whiteboard_id(config_dir=self.config_dir)
+
+    def test_unresolved_env_placeholders_elsewhere_are_not_touched(self):
+        # 其他鍵的 ${oc.env:...} 不應被解析；匯出流程不該依賴 .env。
+        self.write_custom(
+            "heptabase:\n  whiteboard_id: board\nemail:\n  sender: ${oc.env:NOT_SET_ANYWHERE}\n"
+        )
+        self.assertEqual(load_whiteboard_id(config_dir=self.config_dir), "board")
 
 
 class CallbackTests(unittest.IsolatedAsyncioTestCase):

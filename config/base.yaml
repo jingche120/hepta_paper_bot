@@ -1,4 +1,5 @@
 heptabase:
+  whiteboard_id: null # 要讀取的 Heptabase 白板 ID（白板網址的最後一段）。屬於個人資料，請寫在 config/custom.yaml。
   reading_history_path: data/reading_history.json # 由 `get_hepthabase_bot.py --export` 產生的閱讀紀錄。相對路徑以專案根目錄為基準。
   include_path: null # 只保留符合這些 glob 的分類路徑。需要卡片表格有分類欄才有作用。範例: ["LLM/**"]
   ignore_path: null # 排除符合這些 glob 的分類路徑。範例: ["archive/**"]
