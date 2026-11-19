@@ -1,4 +1,5 @@
 heptabase:
+  whiteboard_id: null # 要讀取的 Heptabase 白板 ID（白板網址的最後一段）。屬於個人資料，請寫在 config/custom.yaml。
   reading_history_path: data/reading_history.json # 由 `get_hepthabase_bot.py --export` 產生的閱讀紀錄。相對路徑以專案根目錄為基準。
   include_path: null # 只保留符合這些 glob 的分類路徑。需要卡片表格有分類欄才有作用。範例: ["LLM/**"]
   ignore_path: null # 排除符合這些 glob 的分類路徑。範例: ["archive/**"]
@@ -44,10 +45,26 @@ reranker:
     base_url: ${oc.env:EMBEDDING_BASE_URL,null}
     model: ${oc.env:EMBEDDING_MODEL,null}
     batch_size: null # 依供應商上限調整。範例: 64
+    tokens_per_minute: null # 每分鐘 token 上限（TPM）。留空用 1,000,000。
+    # embedding API 限制的是 token 數而非請求數；回填時不節流會在幾十秒內撞上 429。
+
+pool:
+  db_path: data/paper_pool.sqlite # 候選池。相對路徑以專案根目錄為基準。
+  n_new: 2 # 每天推薦幾篇「新」論文。
+  n_old: 1 # 每天推薦幾篇池中的舊論文。這是回填的價值所在。
+  new_within_days: 7 # 發表日在幾天內算「新」。注意 IEEE 期刊的日期是期號日期，實務上都會落在「舊」。
+  journal_lookback_days: 30 # 期刊每天重抓「這個天數所在年份」整年，靠池子去重。
+  # 不是真的增量：IEEE 的 publication_date 是期號日期（整年標同一天），
+  # 而 OpenAlex 的 created/updated 日期過濾需要付費方案。設 30 天的效果是
+  # 平時只抓當年度，跨年那一個月同時涵蓋前一年，不會有空窗。
+  openalex_sources: # 要追蹤的期刊。留空即停用期刊來源。
+    - S111326731 # IEEE Transactions on Geoscience and Remote Sensing
+    - S126920919 # IEEE Geoscience and Remote Sensing Letters
+  openalex_mailto: ${oc.env:OPENALEX_MAILTO,""} # 填了會進 OpenAlex 的 polite pool，速率上限較寬鬆。
 
 executor:
   debug: false
+  dry_run: false # 只印出選中的論文，不寄信、也不計入推薦次數。
   send_empty: false # 當天沒有新論文時是否仍寄空信。
-  max_paper_num: 100 # 郵件中呈現的論文數量上限。
   source: ['arxiv'] # 要檢索的來源。範例: ['arxiv','biorxiv','medrxiv','chemrxiv']
-  reranker: local # local 用本機模型（免 API）；api 用 embedding API（免安裝 torch）。
+  reranker: local # 決定 embedding 用哪一種：local 用本機模型（免 API）；api 用 embedding API（免安裝 torch）。

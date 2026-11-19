@@ -105,6 +105,43 @@ class ParseOverviewCardTests(unittest.TestCase):
         paper, _ = parse(card)
         self.assertEqual(paper.title, "論文總覽 PatchTST：延後混合")
 
+    def test_full_title_wins_over_source_paper(self):
+        # 一級標題放短代號、論文全名寫在「完整標題：」，是卡片的標準寫法。
+        card = (
+            "# 論文總覽：PatchTST\n\n"
+            "來源論文：PDF 卡片的名字\n\n"
+            "完整標題：A Time Series Is Worth 64 Words\n\n"
+            "## English Abstract\n\nBody."
+        )
+        paper, _ = parse(card)
+        self.assertEqual(paper.title, "A Time Series Is Worth 64 Words")
+
+    def test_full_title_drops_markdown_emphasis(self):
+        card = (
+            "# 論文總覽：PatchTST\n\n"
+            "完整標題：*A Time Series Is Worth 64 Words*\n\n"
+            "## English Abstract\n\nBody."
+        )
+        paper, _ = parse(card)
+        self.assertEqual(paper.title, "A Time Series Is Worth 64 Words")
+
+    def test_url_like_full_title_falls_back_to_source_paper(self):
+        # 「完整標題：」貼成網址時，寧可退回來源論文，也不要拿網址當標題。
+        card = (
+            "# 論文總覽：PatchTST\n\n"
+            "來源論文：Real Paper Name\n\n"
+            "完整標題：https://arxiv.org/abs/2211.14730\n\n"
+            "## English Abstract\n\nBody."
+        )
+        paper, _ = parse(card)
+        self.assertEqual(paper.title, "Real Paper Name")
+
+    def test_card_without_full_title_still_uses_source_paper(self):
+        # 既有卡片沒有「完整標題：」那一行，退路必須維持原樣。
+        card = "# 論文總覽：短代號\n\n來源論文：Real Paper Name\n\n## English Abstract\n\nBody."
+        paper, _ = parse(card)
+        self.assertEqual(paper.title, "Real Paper Name")
+
     def test_html_entities_are_unescaped(self):
         card = "# T\n\n來源論文：Attention &amp;amp; Beyond\n\n## English Abstract\n\nBody."
         paper, _ = parse(card)

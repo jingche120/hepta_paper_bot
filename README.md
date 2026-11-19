@@ -21,6 +21,12 @@ Heptabase 白板 --匯出--> data/reading_history.json --讀取--> 檢索 → �
 想了解設計理由、各檔案職責與已知限制，看 [docs/專案說明.md](docs/專案說明.md)；
 本文件只講安裝與操作。
 
+**平台**：macOS 與 Windows 都可執行。本文件的指令以 macOS 寫法為準，Windows 請換成
+venv 的對應路徑：`.venv/bin/python` → `.venv\Scripts\python.exe`、
+`.venv/bin/ruff` → `.venv\Scripts\ruff.exe`。OAuth 授權在 macOS 存進鑰匙圈、
+在 Windows 存進認證管理員，兩者都由作業系統加密保管，不會落到明文檔案。
+每天自動執行的設定見〈[每日排程](#每日排程)〉。
+
 ## Heptabase 連線：如何執行
 
 在專案目錄執行：
@@ -31,16 +37,20 @@ Heptabase 白板 --匯出--> data/reading_history.json --讀取--> 檢索 → �
 
 首次執行請在自動開啟的瀏覽器登入 Heptabase 並允許授權，然後回到終端機查看結果。
 macOS 也可能要求允許 Python 存取鑰匙圈；請確認提示來自本專案使用的 Python。
+Windows 改用認證管理員，通常不會另外提示，但防火牆可能詢問是否允許本機回呼埠。
 再次執行通常不需開啟瀏覽器；授權遭撤銷或 refresh token 失效時仍可能需要重新登入。
 只有 MCP 初始化成功才會顯示「Heptabase MCP 連線成功」。
 回呼頁顯示已收到回應，不代表權杖交換及 MCP 初始化已成功，請以終端機為準。
 
-需要 macOS 與 Python 3.11 以上。首次安裝（既有使用者也需重新安裝依賴）：
+需要 macOS 或 Windows，以及 Python 3.11 以上。首次安裝（既有使用者也需重新安裝依賴）：
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
+
+Windows 用 `py -3.12 -m venv .venv` 建立環境（`.venv/` 不可跨平台複製，一定要重建）。
+`keyring` 會一併帶入 Windows 需要的 `pywin32-ctypes`，不必另外安裝。
 
 瀏覽器與程式需在同一台電腦。本機回呼使用 `127.0.0.1:8765`，請勿同時啟動兩份程式。
 授權等候上限為 5 分鐘；可按 Ctrl+C 取消。若瀏覽器無法自動開啟，程式會顯示授權網址供你在本機開啟。
@@ -56,7 +66,7 @@ python3 -m venv .venv
 5. `streamable_http_client(...)`：建立 MCP 的 HTTP 傳輸通道，得到接收端 `read` 與傳送端 `write`；`_` 表示此處不使用的第三個回傳值。
 6. `ClientSession(read, write)`：在傳輸通道上建立 MCP 工作階段。
 7. `await session.initialize()`：送出 MCP 初始化請求並等待結果。需要授權時，HTTP 層會啟動 OAuth、開啟瀏覽器、取得權杖，再繼續請求。
-8. `list_whiteboard_cards(session, WHITEBOARD_ID)`：列出白板上的卡片。不加 `--export` 時只印出標題清單；加了就進入 `export_whiteboard()`，逐張 `read_card()` 並解析成閱讀紀錄。離開 `async with` 區塊時，自動關閉連線。
+8. `list_whiteboard_cards(session, whiteboard_id)`：列出白板上的卡片。不加 `--export` 時只印出標題清單；加了就進入 `export_whiteboard()`，逐張 `read_card()` 並解析成閱讀紀錄。離開 `async with` 區塊時，自動關閉連線。
 
 `async def` 宣告可以等待的非同步函式；`await` 表示等候結果，同時讓其他非同步工作繼續，例如接收瀏覽器回呼。
 `async with` 負責資源的建立與清理，即使中途發生錯誤也會執行清理。
@@ -117,14 +127,18 @@ URL 的 `:tokens` 與 `:client` 兩個項目；下次執行會重新授權。這
 它允許使用 refresh token 自動更新；macOS 鑰匙圈的系統權限提示與 OAuth 是不同機制。
 此測試確認當次執行不需 OAuth，並不保證授權永不失效。
 
-### 固定讀取的白板
+### 設定要讀取的白板
 
-白板 ID 固定在 `get_hepthabase_bot.py` 的 `WHITEBOARD_ID`：
+白板 ID 屬於個人資料，不寫在原始碼，而是放在不進版控的 `config/custom.yaml`：
 
-```python
-# 白板「讀過的論文總覽們」，每張卡片是一篇讀過的論文總覽。
-WHITEBOARD_ID = "00000000-0000-4000-8000-000000000000"
+```yaml
+heptabase:
+  # 白板網址 https://app.heptabase.com/.../whiteboard/<白板 ID> 的最後一段。
+  whiteboard_id: <白板 ID>
 ```
+
+也可以臨時用 `--whiteboard <白板 ID>` 覆寫。沒設定時程式會直接提示並結束，不會猜一個預設值。
+換電腦時記得一併補上這個設定（`scripts/check_setup.py` 會檢查）。
 
 直接執行程式或按編輯器的執行按鈕，會列出白板上的卡片標題與建立時間，作為連線檢查；
 **不會輸出卡片內文**。加上 `--export` 才會逐張讀取、解析並存檔（見下一節）。
@@ -132,8 +146,8 @@ WHITEBOARD_ID = "00000000-0000-4000-8000-000000000000"
 讀取會處理長內容分頁，不呼叫 LLM，也不修改 Heptabase。
 請勿將含私密內容的終端機輸出貼到公開日誌。
 
-請勿同時啟動多份程式。未來排程需使用同一個 macOS 使用者與 Python，並確保電腦開機、
-鑰匙圈可存取；首次授權與權限設定先互動完成。目前尚未建立每日排程。
+請勿同時啟動多份程式。排程需使用同一個作業系統使用者與同一個 Python，並確保電腦開機；
+首次授權與權限設定先互動完成。設定方式見〈[每日排程](#每日排程)〉。
 
 ## 匯出閱讀紀錄
 
@@ -164,6 +178,8 @@ WHITEBOARD_ID = "00000000-0000-4000-8000-000000000000"
 
 來源論文：Real-time Seismic Intensity Prediction using Self-supervised Contrastive GNN
 
+完整標題：Real-time Seismic Intensity Prediction using Self-supervised Contrastive GNN
+
 ## English Abstract
 
 This paper studies regional earthquake early warning as a direct regression problem...
@@ -182,7 +198,7 @@ Earthquake Early Warning、Seismic Intensity Prediction、SC-GNN。
 
 | 卡片內容 | 對應閱讀紀錄欄位 | 作用 |
 |---|---|---|
-| `來源論文：` 那一行 | `title` | **不參與計分**，只用於顯示與日誌 |
+| `完整標題：` 那一行（沒有則 `來源論文：`） | `title` | **不參與計分**，只用於顯示與日誌 |
 | `## English Abstract` + `## 中文摘要` | `abstract` | **唯一決定推薦品質的欄位** |
 | `## 關鍵字` | `paths` | 供 `include_path` / `ignore_path` 做 glob 篩選 |
 | 卡片建立時間（來自 `list_cards`） | `added_date` | 時間衰減權重，越新的卡片權重越高 |
@@ -195,8 +211,12 @@ Earthquake Early Warning、Seismic Intensity Prediction、SC-GNN。
   中文摘要則補上你關注的角度。兩節都寫效果最好，只寫一節也能運作。
 - **章節名稱有彈性**：英文摘要接受 `English Abstract`／`Abstract`／`英文摘要`；
   中文摘要接受 `中文摘要`／`摘要`；關鍵字接受 `關鍵字`／`關鍵詞`／`Keywords`。
-- **標題來源**：優先取 `來源論文：`（真正的論文名），其次卡片的一級標題，
-  最後才用 `list_cards` 回報的卡片標題。`<hepta-mention>` 標籤會被移除，內文保留。
+- **標題來源**：依序取 `完整標題：`、`來源論文：`、卡片的一級標題，最後才用
+  `list_cards` 回報的卡片標題。`完整標題：` 是你手寫的論文全名，最可信，所以排最前面
+  —— 有了它，一級標題就能自由寫成短代號（`# 論文總覽：PatchTST`）。
+  `來源論文：` 指向的 PDF 卡片有時以 arXiv 查詢字串命名，那不是標題，會被自動跳過；
+  `完整標題：` 同樣受這道檢查保護。兩者的前後 `*`／`_` 強調符號會去掉，
+  `<hepta-mention>` 標籤會被移除、內文保留。
 - **關鍵字分隔符**：頓號、逗號、分號都可以，結尾句號會自動去掉。
 - **找不到摘要章節時**，會退回使用整張卡片內文，並在匯出結束時列出這些卡片提醒你補寫 ——
   不會靜默漏掉整篇論文。
@@ -271,6 +291,43 @@ macOS 的 python.org 版 Python 預設沒有 CA 憑證，抓 arXiv RSS 會以
 之後申請到金鑰，把 `OPENAI_API_KEY` 寫進 `.env` 即可啟用 TLDR。
 若也想改用 API embedding 省下 torch，再把 `executor.reranker` 改成 `api`
 並填好 `.env` 的 `EMBEDDING_*` 變數。
+
+## 每日排程
+
+只有 `main.py` 適合排程。`get_hepthabase_bot.py --export` 需要瀏覽器授權，
+無法無人值守執行 —— 但排程讀的是已匯出的 `data/reading_history.json`，
+所以閱讀紀錄隔一段時間手動更新一次即可，不影響每天的推薦。
+
+### Windows（工作排程器）
+
+`scripts/run_daily.bat` 已備妥：它會切換到專案目錄、設定 `PYTHONUTF8=1`，
+再把輸出附加到 `logs/daily.log`。`PYTHONUTF8=1` 是必要的 —— 排程非互動執行時
+主控台會退回 ANSI 代碼頁（繁中 Windows 是 cp950），論文標題若含代碼頁外的字元
+會在半途丟 `UnicodeEncodeError` 中斷整場執行。
+
+開啟「工作排程器」→ **建立工作**（不是「建立基本工作」，選項不夠）：
+
+| 頁籤 | 設定 |
+| --- | --- |
+| 一般 | 只在使用者登入時執行 |
+| 觸發程序 | 每天，開始時間 09:00 |
+| 動作 → 程式或指令碼 | `<專案路徑>\scripts\run_daily.bat` |
+| 動作 → 起始於 | `<專案路徑>` |
+| 設定 | 失敗時每 30 分鐘重試、最多 3 次；執行超過 1 小時則停止 |
+
+建立後先按「執行」手動觸發一次，確認結果碼為 `0x0`，不要等到隔天才發現問題。
+
+### macOS（launchd）
+
+尚未建立。可用 `launchd` 的 `StartCalendarInterval`，指向 `.venv/bin/python main.py`
+並把 `WorkingDirectory` 設為專案目錄。
+
+### 排程時的路徑
+
+`main.py` 啟動時會 `os.chdir()` 到專案根目錄，所以 `config` 裡的相對路徑
+（`pool.db_path`、Hydra 的 `outputs/`）不受排程器的工作目錄影響。
+少了這一步，排程器會用自己的預設工作目錄，程式**會默默建立一個空的候選池**
+並推薦出無意義的結果，且不會報錯 —— 驗收時請確認 log 顯示的池中筆數不是 0。
 
 ## 開發檢查
 

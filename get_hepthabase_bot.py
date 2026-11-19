@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+import sys
 from pathlib import Path
 
 import httpx
@@ -20,20 +21,46 @@ from heptabase_reading_history import (
 )
 
 MCP_URL = "https://api.heptabase.com/mcp"
-# 白板「讀過的論文總覽們」，每張卡片是一篇讀過的論文總覽。
-WHITEBOARD_ID = "00000000-0000-4000-8000-000000000000"
 DEFAULT_EXPORT_PATH = Path("data/reading_history.json")
+CONFIG_DIR = Path(__file__).resolve().parent / "config"
 
 
-async def export_whiteboard(session, export_path):
+class WhiteboardConfigError(ValueError):
+    """沒有設定要讀取的白板。"""
+
+
+def load_whiteboard_id(override=None, config_dir=CONFIG_DIR):
+    """取得要讀取的白板 ID：命令列優先，其次 config 的 `heptabase.whiteboard_id`。
+
+    白板 ID 指向你私人的 Heptabase 白板，因此不寫進原始碼，而是放在不進版控的
+    `config/custom.yaml`。只讀這一個鍵，不會觸發 `${oc.env:...}` 解析。
+    """
+    if override:
+        return override.strip()
+    from omegaconf import OmegaConf
+
+    files = [config_dir / "base.yaml", config_dir / "custom.yaml"]
+    config = OmegaConf.merge(*(OmegaConf.load(f) for f in files if f.exists()))
+    value = OmegaConf.select(config, "heptabase.whiteboard_id")
+    if not value or not str(value).strip():
+        raise WhiteboardConfigError(
+            "尚未設定白板 ID。請在 config/custom.yaml 加上：\n"
+            "  heptabase:\n"
+            "    whiteboard_id: <白板 ID>\n"
+            "或執行時加 --whiteboard <白板 ID>。白板 ID 在 Heptabase 白板網址的最後一段。"
+        )
+    return str(value).strip()
+
+
+async def export_whiteboard(session, export_path, whiteboard_id):
     """讀取白板上每張卡片，解析成閱讀紀錄，並保留原始全文供人工核對。"""
     export_path = resolve_path(export_path)
     raw_path = export_path.with_name("heptabase_cards_raw.txt")
     raw_path.parent.mkdir(parents=True, exist_ok=True)
 
-    listed = await list_whiteboard_cards(session, WHITEBOARD_ID)
+    listed = await list_whiteboard_cards(session, whiteboard_id)
     if not listed:
-        raise ReadingHistoryError(f"白板 {WHITEBOARD_ID} 沒有卡片，請確認白板 ID 與卡片位置。")
+        raise ReadingHistoryError(f"白板 {whiteboard_id} 沒有卡片，請確認白板 ID 與卡片位置。")
     print(f"白板上有 {len(listed)} 張卡片，開始逐張讀取…")
 
     papers = []
@@ -58,7 +85,7 @@ async def export_whiteboard(session, export_path):
         )
 
     raw_path.write_text("\n\n".join(raw_blocks), encoding="utf-8")
-    dump_reading_history(papers, export_path, WHITEBOARD_ID)
+    dump_reading_history(papers, export_path, whiteboard_id)
     print(f"\n已匯出 {len(papers)} 篇論文到 {export_path}。")
     print(f"原始卡片全文已存到 {raw_path}。")
     if fallbacks:
@@ -68,7 +95,7 @@ async def export_whiteboard(session, export_path):
         print("補上摘要章節可讓相似度比對更準確。")
 
 
-async def connect(*, no_browser=False, export_path=None):
+async def connect(whiteboard_id, *, no_browser=False, export_path=None):
     # 1. 準備 OAuth：需要登入時，自動開啟瀏覽器並接收授權回呼。
     async with oauth_connection(MCP_URL, allow_browser=not no_browser) as oauth:
         # 2. HTTP 用戶端交由 OAuth 元件處理授權及存取權杖。
@@ -82,13 +109,13 @@ async def connect(*, no_browser=False, export_path=None):
                     print("Heptabase MCP 連線成功。")
                     if export_path is None:
                         # 不加 --export 時只列出卡片標題，作為連線檢查，不輸出卡片內文。
-                        listed = await list_whiteboard_cards(session, WHITEBOARD_ID)
-                        print(f"白板「讀過的論文總覽們」上有 {len(listed)} 張卡片：")
+                        listed = await list_whiteboard_cards(session, whiteboard_id)
+                        print(f"白板上有 {len(listed)} 張卡片：")
                         for card in listed:
                             print(f"  - {card['title']}（建立於 {card['created_at']}）")
                         print("\n加上 --export 可解析成閱讀紀錄。")
                     else:
-                        await export_whiteboard(session, export_path)
+                        await export_whiteboard(session, export_path, whiteboard_id)
                     if no_browser:
                         print("免 OAuth 互動驗證成功：本次未開啟瀏覽器授權。")
     # 離開 async with 後，自動關閉連線與本機回呼服務。
@@ -106,9 +133,8 @@ def report_error(error):
     elif isinstance(error, ReadingHistoryError):
         print(f"卡片解析失敗：{error}")
     elif isinstance(error, KeychainStorageError):
-        print(
-            "鑰匙圈存取失敗。請確認 macOS 鑰匙圈已解鎖、允許此 Python 存取，且已安裝 requirements.txt。"
-        )
+        store = "Windows 認證管理員" if sys.platform == "win32" else "macOS 鑰匙圈"
+        print(f"憑證存取失敗。請確認{store}可用、允許此 Python 存取，且已安裝 requirements.txt。")
     elif isinstance(error, httpx.HTTPStatusError):
         print(f"HTTP 請求失敗：{error.response.status_code}。")
     elif isinstance(error, (TimeoutError, httpx.TimeoutException)):
@@ -131,11 +157,21 @@ def main():
         metavar="PATH",
         help=f"解析卡片並匯出閱讀紀錄，預設 {DEFAULT_EXPORT_PATH}；不指定則只列出卡片標題",
     )
+    parser.add_argument(
+        "--whiteboard",
+        metavar="ID",
+        help="要讀取的白板 ID；預設讀 config/custom.yaml 的 heptabase.whiteboard_id",
+    )
     args = parser.parse_args()
+    try:
+        whiteboard_id = load_whiteboard_id(args.whiteboard)
+    except WhiteboardConfigError as error:
+        print(error)
+        return 2
     # SDK 錯誤日誌可能含授權網址，因此不直接印出完整例外或日誌。
     logging.disable(logging.CRITICAL)
     try:
-        asyncio.run(connect(no_browser=args.no_browser, export_path=args.export))
+        asyncio.run(connect(whiteboard_id, no_browser=args.no_browser, export_path=args.export))
     except KeyboardInterrupt:
         print("已取消連線。")
         return 130

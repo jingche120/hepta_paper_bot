@@ -130,5 +130,33 @@ class ExecutorFetchTests(unittest.TestCase):
         self.assertEqual(papers[1].full_text, "ok")
 
 
+class PooledPaperFallbackTests(unittest.TestCase):
+    """池中的舊論文不在當次 API 快取裡，只能由網址推導來源。"""
+
+    def test_full_text_works_for_a_paper_never_seen_this_run(self):
+        retriever = arxiv_retriever()
+        # 沒有呼叫 convert_to_paper，快取是空的——這正是回填論文的情況。
+        paper = Paper(
+            source="arxiv",
+            title="Old",
+            authors=[],
+            abstract="a",
+            url="https://arxiv.org/abs/2211.14730",
+            pdf_url="https://arxiv.org/pdf/2211.14730",
+        )
+        seen = []
+
+        def fake_tar(ref):
+            seen.append(ref.entry_id)
+            return "tex body"
+
+        with patch(
+            "zotero_arxiv_daily.retriever.arxiv_retriever.extract_text_from_tar",
+            side_effect=fake_tar,
+        ):
+            self.assertEqual(retriever.fetch_full_text(paper), "tex body")
+        self.assertEqual(seen, ["https://arxiv.org/abs/2211.14730"])
+
+
 if __name__ == "__main__":
     unittest.main()

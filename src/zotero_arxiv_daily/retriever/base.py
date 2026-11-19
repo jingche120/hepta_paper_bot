@@ -29,6 +29,14 @@ class BaseRetriever(ABC):
         """
         return paper.full_text
 
+    def published_date(self, paper:Paper) -> str | None:
+        """ISO date the paper was published, or None when the source does not say.
+
+        The pool splits candidates into new and backlog by this date, so a retriever
+        that cannot supply it will have all its papers treated as backlog.
+        """
+        return None
+
     def retrieve_papers(self) -> list[Paper]:
         raw_papers = self._retrieve_raw_papers()
         logger.info("Processing papers...")

@@ -2,7 +2,7 @@
 
 ## Project Status
 
-A daily paper recommendation bot. The reading history (this project's term for the interest corpus) comes from the Heptabase whiteboard 「讀過的論文總覽們」, where each card is one paper overview; the bot retrieves new papers from arXiv and similar sources, ranks them by embedding similarity against that reading history, and emails the list. Git resolves to a parent repository; scope changes to this project directory and avoid staging sibling projects.
+A daily paper recommendation bot. The reading history (this project's term for the interest corpus) comes from the Heptabase whiteboard 「讀過的論文總覽們」, where each card is one paper overview; the bot retrieves new papers from arXiv and similar sources, ranks them by embedding similarity against that reading history, and emails the list.
 
 ## Project Structure & Module Organization
 
@@ -16,6 +16,8 @@ Two layers, deliberately kept apart:
 Keep entry points thin.
 
 ## Build, Test, and Development Commands
+
+Commands below use the POSIX venv layout; on Windows substitute `.venv\Scripts\python.exe` for `.venv/bin/python` and `.venv\Scripts\ruff.exe` for `.venv/bin/ruff`. The project runs on both macOS and Windows — keep platform branches (notably `heptabase_keychain._load_backend`) working on both, and do not hardcode `.venv/bin/python` in strings the program prints; use `sys.executable`.
 
 Use Python 3.11+ (the current `.venv` is 3.12; note that `glob.translate` is 3.13-only, so `utils.glob_match` carries a backport — keep both paths tested). Create a virtual environment with `python3 -m venv .venv`, then install with `.venv/bin/python -m pip install -r requirements.txt` (add `-r requirements-reranker.txt` for the local embedding model). Run `.venv/bin/python get_hepthabase_bot.py` to complete browser OAuth and verify MCP initialization, `.venv/bin/python get_hepthabase_bot.py --export` to refresh the reading history, and `.venv/bin/python main.py` for the recommendation run. Run `.venv/bin/python -m unittest discover -s tests -v` for offline tests.
 
